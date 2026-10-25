@@ -129,6 +129,14 @@ When a root is set, relative paths resolve against it. Any target outside it fai
 - **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
 - **Concurrent changes:** if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
 
+### Known limitations
+
+These come from Node.js and POSIX file semantics. They are documented on purpose rather than patched with non-portable workarounds.
+
+- **Residual race window:** the concurrent-modification check runs right before the renames, but a write that lands between that check and the `rename()` can still be lost. Closing that gap needs advisory locks (`flock`), which Node.js does not expose portably.
+- **Hard links:** a file is replaced through temp file + `rename()`, so a file with several hard links is split. The edited path gets the new content and the other links keep the old content.
+- **File ownership:** permission bits are preserved, but the owner and group are not. If the server runs as a different user than the file's owner, the edited file will belong to the server's user.
+
 ## Development
 
 ```bash
