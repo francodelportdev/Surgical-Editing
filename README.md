@@ -1,6 +1,8 @@
 # Surgical Editing
 
-A transactional, exact-match file editing engine for any MCP client (Cline, Claude Desktop, Python agents, CI/CD pipelines…), exposed as a single tool: `surgical_replace`.
+**Transactional file editing for AI agents: atomic multi-file changes that protect your code, and self-correcting errors that save tokens.**
+
+An exact-match editing engine for any MCP client (Cline, Claude Desktop, Python agents, CI/CD pipelines…), exposed as a single tool: `surgical_replace`.
 
 ## What is Surgical Editing?
 

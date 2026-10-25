@@ -1,7 +1,7 @@
 {
   "name": "surgical-editing",
   "version": "0.3.0",
-  "description": "MCP server exposing surgical_replace: exact, unique, atomic find/replace edits to minimize LLM output tokens.",
+  "description": "Transactional file editing for AI agents: atomic multi-file changes that protect your code, and self-correcting errors that save tokens.",
   "type": "module",
   "license": "MIT",
   "bin": {
