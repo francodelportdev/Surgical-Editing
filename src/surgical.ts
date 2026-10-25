@@ -30,8 +30,13 @@ export interface AppliedReplacement {
   index: number;
   find: string;
   replace: string;
-  /** 1-based line where the match started, to help the LLM verify the edit. */
+  /** 1-based line where the replaced text starts in the final content. */
   line: number;
+  /**
+   * The edited region plus surrounding lines from the final content, numbered,
+   * so the agent can verify the result without re-reading the file.
+   */
+  context: string;
 }
 
 export interface FileChange {
@@ -62,6 +67,13 @@ interface FileState {
   mtimeMs: number;
   size: number;
   applied: AppliedReplacement[];
+  /** Offsets of each applied replacement in `content`, parallel to `applied`. */
+  spans: Span[];
+}
+
+interface Span {
+  start: number;
+  end: number;
 }
 
 const NOTHING_WRITTEN = "No files were written.";
@@ -70,21 +82,28 @@ const NOT_UTF8 = "File is not valid UTF-8 or is binary. Surgical editing aborted
 // fatal: invalid byte sequences throw instead of silently becoming U+FFFD,
 // which would then be written back and destroy the original bytes.
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+const CONTEXT_LINES = 1;
+const MAX_CONTEXT_REGION_LINES = 10;
+const MAX_LISTED_LINES = 10;
 
 /**
- * Counts occurrences of `needle` in `haystack`, including overlapping ones.
- * We count overlaps on purpose: with "aa" inside "aaa" a non-overlapping
+ * Offsets of every occurrence of `needle` in `haystack`, including overlapping
+ * ones. We count overlaps on purpose: with "aa" inside "aaa" a non-overlapping
  * count would report 1 and hide a real ambiguity about where the edit lands.
  */
-export function countOccurrences(haystack: string, needle: string): number {
-  let count = 0;
+function findOccurrences(haystack: string, needle: string): number[] {
+  const offsets: number[] = [];
   let from = 0;
   for (;;) {
     const idx = haystack.indexOf(needle, from);
-    if (idx === -1) return count;
-    count++;
+    if (idx === -1) return offsets;
+    offsets.push(idx);
     from = idx + 1;
   }
+}
+
+export function countOccurrences(haystack: string, needle: string): number {
+  return findOccurrences(haystack, needle).length;
 }
 
 function lineAt(content: string, offset: number): number {
@@ -93,6 +112,27 @@ function lineAt(content: string, offset: number): number {
     if (content.charCodeAt(i) === 10) line++;
   }
   return line;
+}
+
+/**
+ * Numbered excerpt of `content` covering [start, end) plus CONTEXT_LINES on
+ * each side. Large regions keep only their head and tail: the agent already
+ * knows the text it sent, it only needs to see the seams.
+ */
+function contextAround(lines: readonly string[], content: string, span: Span): string {
+  const firstLine = lineAt(content, span.start);
+  const lastLine = lineAt(content, Math.max(span.start, span.end - 1));
+  const from = Math.max(1, firstLine - CONTEXT_LINES);
+  const to = Math.min(lines.length, lastLine + CONTEXT_LINES);
+  const width = String(to).length;
+  const fmt = (n: number): string => `${String(n).padStart(width)} | ${lines[n - 1]!.replace(/\r$/, "")}`;
+
+  const numbers: number[] = [];
+  for (let n = from; n <= to; n++) numbers.push(n);
+  if (numbers.length <= MAX_CONTEXT_REGION_LINES) return numbers.map(fmt).join("\n");
+
+  const half = MAX_CONTEXT_REGION_LINES / 2;
+  return [...numbers.slice(0, half).map(fmt), `${" ".repeat(width)} | …`, ...numbers.slice(-half).map(fmt)].join("\n");
 }
 
 function preview(text: string, max = 80): string {
@@ -193,6 +233,7 @@ async function loadFile(filePath: string): Promise<FileState | string> {
     mtimeMs: info.mtimeMs,
     size: info.size,
     applied: [],
+    spans: [],
   };
 }
 
@@ -222,21 +263,53 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
   // Uniqueness is the core safety guarantee: if the LLM's snippet is
   // ambiguous we cannot know which occurrence it meant, and guessing could
   // silently corrupt the file.
-  const matches = countOccurrences(state.content, r.find);
-  if (matches === 0) return notFoundMessage(state.content, r.find);
-  if (matches > 1) {
+  const occurrences = findOccurrences(state.content, r.find);
+  if (occurrences.length === 0) return notFoundMessage(state.content, r.find);
+  if (occurrences.length > 1) {
+    // Listing where each occurrence lives tells the agent which context to add
+    // without re-reading the file.
+    const lines = [...new Set(occurrences.map((o) => lineAt(state.content, o)))];
+    const listed = lines.slice(0, MAX_LISTED_LINES).join(", ");
+    const more = lines.length > MAX_LISTED_LINES ? `, … +${lines.length - MAX_LISTED_LINES} more` : "";
     return (
-      `"find" text ${preview(r.find)} is ambiguous — it appears ${matches} times. ` +
+      `"find" text ${preview(r.find)} is ambiguous — it appears ${occurrences.length} times ` +
+      `(line${lines.length > 1 ? "s" : ""} ${listed}${more}). ` +
       `Include more surrounding context so it matches exactly once.`
     );
   }
 
-  const offset = state.content.indexOf(r.find);
+  const offset = occurrences[0]!;
+  const findEnd = offset + r.find.length;
+  const delta = r.replace.length - r.find.length;
   // Splice by offset instead of String.prototype.replace so that "$&", "$1"
   // etc. in `replace` are inserted literally rather than as patterns.
-  state.content = state.content.slice(0, offset) + r.replace + state.content.slice(offset + r.find.length);
-  state.applied.push({ operation, index, find: r.find, replace: r.replace, line: lineAt(state.content, offset) });
+  state.content = state.content.slice(0, offset) + r.replace + state.content.slice(findEnd);
+
+  // Keep earlier spans pointing at their text in the new content: shift the
+  // ones after this edit, and grow any span this edit overlapped.
+  for (const span of state.spans) {
+    if (span.start >= findEnd) {
+      span.start += delta;
+      span.end += delta;
+    } else if (span.end > offset) {
+      span.start = Math.min(span.start, offset);
+      span.end = Math.max(span.end + delta, offset + r.replace.length);
+    }
+  }
+  state.spans.push({ start: offset, end: offset + r.replace.length });
+  // line/context are filled from the final content once all edits are applied.
+  state.applied.push({ operation, index, find: r.find, replace: r.replace, line: 0, context: "" });
   return undefined;
+}
+
+/** Fills line numbers and context for every applied replacement from the final content. */
+function finalizeApplied(state: FileState): void {
+  const lines = state.content.split("\n");
+  for (const [i, applied] of state.applied.entries()) {
+    const span = state.spans[i]!;
+    applied.line = lineAt(state.content, span.start);
+    applied.context = contextAround(lines, state.content, span);
+  }
 }
 
 function tempPathFor(filePath: string): string {
@@ -371,6 +444,7 @@ export async function surgicalTransaction(
   }
 
   const states = [...files.values()];
+  states.forEach(finalizeApplied);
   const changes: FileChange[] = states.map((s) => ({
     filePath: s.filePath,
     applied: s.applied,
@@ -407,10 +481,15 @@ export function formatTransaction(result: Extract<TransactionResult, { ok: true 
   }
 
   const blocks = result.files.map((f) => {
-    const lines = f.applied.map(
-      (r) => `    op #${r.operation} #${r.index} (line ${r.line}): ${preview(r.find, 60)} → ${preview(r.replace, 60)}`,
-    );
-    return `  ${f.filePath}\n${lines.join("\n")}`;
+    const entries = f.applied.map((r) => {
+      const header = `    op #${r.operation} #${r.index} (line ${r.line}): ${preview(r.find, 60)} → ${preview(r.replace, 60)}`;
+      const context = r.context
+        .split("\n")
+        .map((l) => `      ${l}`)
+        .join("\n");
+      return `${header}\n${context}`;
+    });
+    return `  ${f.filePath}\n${entries.join("\n")}`;
   });
   return `Applied ${summary}:\n${blocks.join("\n")}`;
 }

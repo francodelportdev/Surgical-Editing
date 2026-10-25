@@ -48,7 +48,20 @@ When a `find` has no exact match, the tool looks for a region at least 80% simil
 Operation #0, Replacement #0 (/repo/src/app.ts): No exact match found. Line 12 contains (96% similar): 'const x = 1'. Hint: File uses CRLF line endings. No files were written.
 ```
 
-Ambiguous matches report how many times the snippet appears. File system errors (missing files, permission denied, read-only file systems) are returned as structured MCP errors (`isError: true`).
+Ambiguous matches report how many times the snippet appears and on which lines (`appears 3 times (lines 4, 18, 52)`), so the agent knows which context to add.
+
+### Verifiable results
+
+On success, each replacement comes back with its final line number and a numbered excerpt of the result, so the agent can check its edit without re-reading the file:
+
+```
+Applied 1 replacement(s) across 1 file(s):
+  /repo/src/config.ts
+    op #0 #0 (line 4): "retries = 3" → "retries = 5"
+      3 | const host = "localhost";
+      4 | const retries = 5;
+      5 | export { port, host, retries };
+``` File system errors (missing files, permission denied, read-only file systems) are returned as structured MCP errors (`isError: true`).
 
 ### Dry run
 
