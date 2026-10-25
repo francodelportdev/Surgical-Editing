@@ -104,8 +104,8 @@ export function findClosestMatch(
     if (needleCollapsed.length > 0 && collapseWhitespace(windowText).includes(needleCollapsed)) {
       const hint =
         fileUsesCrlf !== needleUsesCrlf
-          ? `Line endings differ: the file uses ${fileUsesCrlf ? "CRLF (\\r\\n)" : "LF (\\n)"}.`
-          : "Text matches except for whitespace (indentation, spaces or tabs).";
+          ? `File uses ${fileUsesCrlf ? "CRLF" : "LF"} line endings.`
+          : "Only whitespace differs (indentation, spaces or tabs).";
       return { line: start + 1, text: previewLines(window), similarity: 1, hint };
     }
   }

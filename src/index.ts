@@ -2,39 +2,67 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { formatSuccess, surgicalReplace } from "./surgical.js";
+import { formatTransaction, surgicalTransaction, type Operation } from "./surgical.js";
 
-const server = new McpServer({ name: "surgical-editing-server", version: "0.1.0" });
+const server = new McpServer({ name: "surgical-editing-server", version: "0.2.0" });
+
+const replacementsSchema = z
+  .array(
+    z.object({
+      find: z.string().min(1).describe("Exact text to find. Must occur exactly once in the file."),
+      replace: z.string().describe("Exact text that replaces it."),
+    }),
+  )
+  .min(1);
 
 server.registerTool(
   "surgical_replace",
   {
     title: "Surgical replace",
     description:
-      "Edit a file by sending ONLY the minimal exact snippets to change. Each `find` must appear exactly once " +
-      "in the file (add a little surrounding context if needed). All replacements are applied atomically: " +
-      "if any fails, the file is not modified. Prefer the smallest unique snippet over rewriting whole lines or blocks.",
+      "Transactional exact-match editor. Send ONLY the minimal snippets to change, across one or more files. " +
+      "Each `find` must appear exactly once in its file. All operations are atomic: if any replacement fails, " +
+      "no file is written. On a miss, the error points to the most similar line so you can retry without re-reading. " +
+      "Set dry_run to get a unified diff without writing.",
     inputSchema: {
-      file_path: z.string().min(1).describe("Absolute or relative path to the target file."),
-      replacements: z
+      operations: z
         .array(
           z.object({
-            find: z.string().min(1).describe("Exact text to find. Must occur exactly once in the file."),
-            replace: z.string().describe("Exact text that replaces it."),
+            file_path: z.string().min(1).describe("Absolute or relative path to the target file."),
+            replacements: replacementsSchema.describe("Replacements for this file, applied in order."),
           }),
         )
         .min(1)
-        .describe("Ordered list of replacements, applied sequentially in memory."),
+        .optional()
+        .describe("Edits to apply as one transaction. Operations on the same file compose in order."),
+      file_path: z.string().min(1).optional().describe("Legacy single-file form; prefer `operations`."),
+      replacements: replacementsSchema.optional().describe("Legacy single-file form; used with `file_path`."),
+      dry_run: z.boolean().optional().describe("Validate and return a unified diff without writing. Default false."),
     },
   },
-  async ({ file_path, replacements }) => {
-    const result = await surgicalReplace(file_path, replacements);
-    if (!result.ok) {
-      return { isError: true, content: [{ type: "text", text: result.error }] };
+  async ({ operations, file_path, replacements, dry_run }) => {
+    // Accept the v1 shape so existing clients keep working, but never both at
+    // once: mixing them would leave it unclear which edits the caller intended.
+    let ops: Operation[];
+    if (operations !== undefined && (file_path !== undefined || replacements !== undefined)) {
+      return errorResult("Provide either `operations` or the legacy `file_path` + `replacements`, not both.");
+    } else if (operations !== undefined) {
+      ops = operations;
+    } else if (file_path !== undefined && replacements !== undefined) {
+      ops = [{ file_path, replacements }];
+    } else {
+      return errorResult("Missing input: provide `operations` (or the legacy `file_path` + `replacements`).");
     }
-    return { content: [{ type: "text", text: formatSuccess(result) }] };
+
+    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false });
+    if (!result.ok) return errorResult(result.error);
+    return { content: [{ type: "text" as const, text: formatTransaction(result) }] };
   },
 );
+
+function errorResult(text: string): { isError: true; content: { type: "text"; text: string }[] } {
+  return { isError: true, content: [{ type: "text", text }] };
+}
 
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();

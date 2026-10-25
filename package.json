@@ -1,6 +1,6 @@
 {
   "name": "surgical-editing",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server exposing surgical_replace: exact, unique, atomic find/replace edits to minimize LLM output tokens.",
   "type": "module",
   "license": "MIT",
