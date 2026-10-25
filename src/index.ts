@@ -1,10 +1,31 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { realpathSync } from "node:fs";
 import { z } from "zod";
 import { formatTransaction, surgicalTransaction, type Operation } from "./surgical.js";
 
-const server = new McpServer({ name: "surgical-editing-server", version: "0.2.0" });
+/**
+ * Sandbox root from `--root <dir>` or SURGICAL_ROOT_DIR (the flag wins).
+ * Resolved once at startup with realpath so comparisons against resolved
+ * target paths are reliable; a bad root is fatal rather than silently
+ * running unsandboxed.
+ */
+function resolveRootDir(): string | undefined {
+  const flagIndex = process.argv.indexOf("--root");
+  const raw = flagIndex !== -1 ? process.argv[flagIndex + 1] : process.env.SURGICAL_ROOT_DIR;
+  if (raw === undefined || raw === "") return undefined;
+  try {
+    return realpathSync(raw);
+  } catch {
+    console.error(`Invalid sandbox root (SURGICAL_ROOT_DIR / --root): ${raw}`);
+    process.exit(1);
+  }
+}
+
+const rootDir = resolveRootDir();
+
+const server = new McpServer({ name: "surgical-editing-server", version: "0.3.0" });
 
 const replacementsSchema = z
   .array(
@@ -54,7 +75,7 @@ server.registerTool(
       return errorResult("Missing input: provide `operations` (or the legacy `file_path` + `replacements`).");
     }
 
-    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false });
+    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir });
     if (!result.ok) return errorResult(result.error);
     return { content: [{ type: "text" as const, text: formatTransaction(result) }] };
   },
@@ -68,7 +89,7 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout is reserved for the MCP protocol; log to stderr only.
-  console.error("surgical-editing-server MCP server running on stdio");
+  console.error(`surgical-editing-server MCP server running on stdio${rootDir ? ` (sandbox: ${rootDir})` : ""}`);
 }
 
 main().catch((err: unknown) => {

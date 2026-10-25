@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
-import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+// Accessed as `fs.*` (not destructured) so tests can intercept calls with mock.method.
+import fs from "node:fs/promises";
 import path from "node:path";
 import { unifiedDiff } from "./diff.js";
 import { findClosestMatch } from "./matcher.js";
@@ -12,6 +13,15 @@ export interface Replacement {
 export interface Operation {
   file_path: string;
   replacements: readonly Replacement[];
+}
+
+export interface TransactionOptions {
+  dryRun?: boolean;
+  /**
+   * Sandbox root. When set, relative paths resolve against it and every
+   * target must stay inside it, both before and after following symlinks.
+   */
+  rootDir?: string;
 }
 
 export interface AppliedReplacement {
@@ -41,14 +51,25 @@ export type SurgicalResult =
   | { ok: false; error: string };
 
 interface FileState {
+  /** Physical path after resolving symlinks; all I/O uses this. */
   filePath: string;
+  /** Exact bytes read from disk, used to restore the file on a failed commit. */
+  originalBytes: Buffer;
   original: string;
   content: string;
+  hasBom: boolean;
   mode: number;
+  mtimeMs: number;
+  size: number;
   applied: AppliedReplacement[];
 }
 
 const NOTHING_WRITTEN = "No files were written.";
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+const NOT_UTF8 = "File is not valid UTF-8 or is binary. Surgical editing aborted to prevent corruption.";
+// fatal: invalid byte sequences throw instead of silently becoming U+FFFD,
+// which would then be written back and destroy the original bytes.
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * Counts occurrences of `needle` in `haystack`, including overlapping ones.
@@ -98,15 +119,81 @@ function describeFsError(err: unknown, action: string, filePath: string): string
   }
 }
 
-async function loadFile(filePath: string): Promise<FileState | string> {
+/**
+ * True if `target` is `root` or lies beneath it. Uses path.relative instead
+ * of a string prefix check, which would wrongly accept "/srv/app-evil" for
+ * the root "/srv/app".
+ */
+function isInside(root: string, target: string): boolean {
+  const rel = path.relative(root, target);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+}
+
+function encode(state: FileState): Buffer {
+  const body = Buffer.from(state.content, "utf8");
+  return state.hasBom ? Buffer.concat([UTF8_BOM, body]) : body;
+}
+
+/**
+ * Resolves the requested path to the physical file that will be edited,
+ * enforcing the sandbox. Returns an error message on failure.
+ */
+async function resolveTarget(rawPath: string, rootDir: string | undefined): Promise<string | { path: string }> {
+  const requested = rootDir === undefined ? path.resolve(rawPath) : path.resolve(rootDir, rawPath);
+  if (rootDir !== undefined && !isInside(rootDir, requested)) {
+    return `Path traversal blocked: ${requested} is outside SURGICAL_ROOT_DIR (${rootDir})`;
+  }
+
+  // Follow symlinks so the temp file + rename replaces the real file. Renaming
+  // onto the link path would swap the link for a regular file and leave the
+  // file it pointed to unedited.
+  let real: string;
   try {
-    const info = await stat(filePath);
+    real = await fs.realpath(requested);
+  } catch (err) {
+    return describeFsError(err, "read", requested);
+  }
+
+  // Check again after resolution: a symlink inside the root may point outside it.
+  if (rootDir !== undefined && !isInside(rootDir, real)) {
+    return `Path traversal blocked: ${requested} resolves to ${real}, outside SURGICAL_ROOT_DIR (${rootDir})`;
+  }
+  return { path: real };
+}
+
+async function loadFile(filePath: string): Promise<FileState | string> {
+  let bytes: Buffer;
+  let info: Awaited<ReturnType<typeof fs.stat>>;
+  try {
+    info = await fs.stat(filePath);
     if (!info.isFile()) return `Not a regular file: ${filePath}`;
-    const original = await readFile(filePath, "utf8");
-    return { filePath, original, content: original, mode: info.mode, applied: [] };
+    bytes = await fs.readFile(filePath);
   } catch (err) {
     return describeFsError(err, "read", filePath);
   }
+
+  const hasBom = bytes.subarray(0, 3).equals(UTF8_BOM);
+  const body = hasBom ? bytes.subarray(3) : bytes;
+  let original: string;
+  try {
+    original = strictUtf8.decode(body);
+  } catch {
+    return NOT_UTF8;
+  }
+  // NUL is valid UTF-8 but never appears in text files; treat it as binary.
+  if (original.includes("\0")) return NOT_UTF8;
+
+  return {
+    filePath,
+    originalBytes: bytes,
+    original,
+    content: original,
+    hasBom,
+    mode: info.mode,
+    mtimeMs: info.mtimeMs,
+    size: info.size,
+    applied: [],
+  };
 }
 
 function notFoundMessage(content: string, find: string): string {
@@ -157,6 +244,24 @@ function tempPathFor(filePath: string): string {
 }
 
 /**
+ * Detects files modified by someone else since we read them. Compares size as
+ * well as mtime because some filesystems only store mtime at 1–2 s resolution.
+ */
+async function findConcurrentModification(states: readonly FileState[]): Promise<string | undefined> {
+  for (const state of states) {
+    try {
+      const now = await fs.stat(state.filePath);
+      if (now.mtimeMs !== state.mtimeMs || now.size !== state.size) {
+        return `Concurrent modification detected on ${state.filePath}. Transaction aborted for safety.`;
+      }
+    } catch (err) {
+      return `${describeFsError(err, "re-check", state.filePath)}. Transaction aborted for safety.`;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Two-phase commit across files. Phase 1 writes every new version to a temp
  * file next to its target, where nearly all I/O failures (permissions, disk
  * full) surface while the originals are still untouched. Phase 2 swaps them in
@@ -165,30 +270,42 @@ function tempPathFor(filePath: string): string {
  */
 async function commit(states: readonly FileState[]): Promise<string | undefined> {
   const staged: { state: FileState; tmp: string }[] = [];
+  const discardTemps = (from = 0): Promise<unknown> =>
+    Promise.all(staged.slice(from).map((s) => fs.unlink(s.tmp).catch(() => undefined)));
+
   for (const state of states) {
     // Register the temp path before writing: a failed writeFile can still
     // leave a partial file behind that must be cleaned up.
     const tmp = tempPathFor(state.filePath);
     staged.push({ state, tmp });
     try {
-      await writeFile(tmp, state.content, { encoding: "utf8", mode: state.mode });
+      await fs.writeFile(tmp, encode(state), { mode: state.mode });
     } catch (err) {
-      await Promise.all(staged.map((s) => unlink(s.tmp).catch(() => undefined)));
+      await discardTemps();
       return describeFsError(err, "write", state.filePath);
     }
+  }
+
+  // Last check before the point of no return. Staging temps can take a while
+  // on large transactions; if anyone touched an original in the meantime, our
+  // edits were computed from stale content and would overwrite their changes.
+  const conflict = await findConcurrentModification(states);
+  if (conflict !== undefined) {
+    await discardTemps();
+    return conflict;
   }
 
   const swapped: FileState[] = [];
   for (const [i, { state, tmp }] of staged.entries()) {
     try {
-      await rename(tmp, state.filePath);
+      await fs.rename(tmp, state.filePath);
       swapped.push(state);
     } catch (err) {
-      await Promise.all(staged.slice(i).map((s) => unlink(s.tmp).catch(() => undefined)));
+      await discardTemps(i);
       const failedRestores: string[] = [];
       for (const done of swapped) {
         try {
-          await writeFile(done.filePath, done.original, { encoding: "utf8", mode: done.mode });
+          await fs.writeFile(done.filePath, done.originalBytes, { mode: done.mode });
         } catch {
           failedRestores.push(done.filePath);
         }
@@ -212,23 +329,29 @@ async function commit(states: readonly FileState[]): Promise<string | undefined>
  */
 export async function surgicalTransaction(
   operations: readonly Operation[],
-  options: { dryRun?: boolean } = {},
+  options: TransactionOptions = {},
 ): Promise<TransactionResult> {
   const dryRun = options.dryRun ?? false;
   if (operations.length === 0) return { ok: false, error: `No operations provided. ${NOTHING_WRITTEN}` };
 
   // Several operations may target the same file (even via different relative
-  // paths); they share one in-memory state so edits compose sequentially.
+  // paths or symlinks); keying by physical path makes them share one
+  // in-memory state so edits compose sequentially.
   const files = new Map<string, FileState>();
-  const resolved = operations.map((op) => path.resolve(op.file_path));
+  const resolved: string[] = [];
 
-  for (const [opIndex, filePath] of resolved.entries()) {
-    if (files.has(filePath)) continue;
-    const loaded = await loadFile(filePath);
-    if (typeof loaded === "string") {
-      return { ok: false, error: `Operation #${opIndex}: ${loaded}. ${NOTHING_WRITTEN}` };
+  for (const [opIndex, op] of operations.entries()) {
+    const target = await resolveTarget(op.file_path, options.rootDir);
+    if (typeof target === "string") {
+      return { ok: false, error: `Operation #${opIndex}: ${target}. ${NOTHING_WRITTEN}` };
     }
-    files.set(filePath, loaded);
+    resolved.push(target.path);
+    if (files.has(target.path)) continue;
+    const loaded = await loadFile(target.path);
+    if (typeof loaded === "string") {
+      return { ok: false, error: `Operation #${opIndex} (${target.path}): ${loaded} ${NOTHING_WRITTEN}` };
+    }
+    files.set(target.path, loaded);
   }
 
   for (const [opIndex, op] of operations.entries()) {
@@ -263,8 +386,12 @@ export async function surgicalTransaction(
 }
 
 /** v1 API: a single-file transaction. */
-export async function surgicalReplace(rawPath: string, replacements: readonly Replacement[]): Promise<SurgicalResult> {
-  const result = await surgicalTransaction([{ file_path: rawPath, replacements }]);
+export async function surgicalReplace(
+  rawPath: string,
+  replacements: readonly Replacement[],
+  options: Omit<TransactionOptions, "dryRun"> = {},
+): Promise<SurgicalResult> {
+  const result = await surgicalTransaction([{ file_path: rawPath, replacements }], options);
   if (!result.ok) return result;
   const file = result.files[0]!;
   return { ok: true, filePath: file.filePath, applied: file.applied };
