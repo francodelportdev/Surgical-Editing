@@ -106,6 +106,29 @@ Most clients (Cline, Claude Desktop via `claude_desktop_config.json`, project `.
 
 Relative `file_path` values resolve against the server's working directory. Use absolute paths when that is ambiguous.
 
+### Sandbox
+
+Restrict edits to one directory tree with the `SURGICAL_ROOT_DIR` environment variable or the `--root <dir>` flag (the flag wins):
+
+```json
+{
+  "mcpServers": {
+    "surgical-editing-server": {
+      "command": "node",
+      "args": ["/absolute/path/to/surgical-editing/dist/index.js", "--root", "/path/to/project"]
+    }
+  }
+}
+```
+
+When a root is set, relative paths resolve against it. Any target outside it fails with `Path traversal blocked`, including through a symlink that points outside the root. If the root itself doesn't exist, the server refuses to start.
+
+## Safety guarantees
+
+- **Symlinks:** edits are applied to the file the link points to, and the link stays intact.
+- **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
+- **Concurrent changes:** if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
+
 ## Development
 
 ```bash
