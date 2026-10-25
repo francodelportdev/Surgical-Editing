@@ -18,7 +18,8 @@
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "prepublishOnly": "npm run build",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "npm run typecheck && tsx --test tests/*.test.ts",
+    "typecheck": "tsc -p tsconfig.test.json --noEmit"
   },
   "keywords": [
     "mcp",
