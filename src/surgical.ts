@@ -5,7 +5,7 @@ import path from "node:path";
 import { DEFAULT_LIMITS, type Limits } from "./config.js";
 import { unifiedDiff } from "./diff.js";
 import { findClosestMatch } from "./matcher.js";
-import { isSensitivePath, redactText, truncate } from "./redact.js";
+import { isSensitivePath, redactorFor, redactText, truncate, type LineRedactor } from "./redact.js";
 
 export interface Replacement {
   find: string;
@@ -24,6 +24,8 @@ export interface TransactionOptions {
    * target must stay inside it, both before and after following symlinks.
    */
   rootDir?: string;
+  /** Required instead of `rootDir` to run without a sandbox. */
+  unsafeNoRoot?: boolean;
   /** Resource limits; unspecified fields use DEFAULT_LIMITS. */
   limits?: Partial<Limits>;
 }
@@ -123,13 +125,13 @@ function lineAt(content: string, offset: number): number {
  * each side. Large regions keep only their head and tail: the agent already
  * knows the text it sent, it only needs to see the seams.
  */
-function contextAround(lines: readonly string[], content: string, span: Span): string {
+function contextAround(lines: readonly string[], content: string, span: Span, redact: LineRedactor): string {
   const firstLine = lineAt(content, span.start);
   const lastLine = lineAt(content, Math.max(span.start, span.end - 1));
   const from = Math.max(1, firstLine - CONTEXT_LINES);
   const to = Math.min(lines.length, lastLine + CONTEXT_LINES);
   const width = String(to).length;
-  const fmt = (n: number): string => `${String(n).padStart(width)} | ${lines[n - 1]!.replace(/\r$/, "")}`;
+  const fmt = (n: number): string => `${String(n).padStart(width)} | ${redact(lines[n - 1]!.replace(/\r$/, ""))}`;
 
   const numbers: number[] = [];
   for (let n = from; n <= to; n++) numbers.push(n);
@@ -183,27 +185,40 @@ function encode(state: FileState): Buffer {
  * enforcing the sandbox. Returns an error message on failure.
  */
 async function resolveTarget(rawPath: string, rootDir: string | undefined): Promise<string | { path: string }> {
-  const requested = rootDir === undefined ? path.resolve(rawPath) : path.resolve(rootDir, rawPath);
-  if (rootDir !== undefined && !isInside(rootDir, requested)) {
+  if (rootDir === undefined) return resolveUnsandboxed(path.resolve(rawPath));
+
+  let realRoot: string;
+  try {
+    realRoot = await fs.realpath(rootDir);
+  } catch {
+    return `Sandbox root is not accessible: ${rootDir}`;
+  }
+  const requested = path.resolve(rootDir, rawPath);
+  // Accept either spelling of the root (e.g. /var vs /private/var); the realpath check below is authoritative.
+  if (!isInside(path.resolve(rootDir), requested) && !isInside(realRoot, requested)) {
     return `Path traversal blocked: ${requested} is outside SURGICAL_ROOT_DIR (${rootDir})`;
   }
 
-  // Follow symlinks so the temp file + rename replaces the real file. Renaming
-  // onto the link path would swap the link for a regular file and leave the
-  // file it pointed to unedited.
+  // Follow symlinks so the temp file + rename replaces the real file instead of the link.
   let real: string;
   try {
     real = await fs.realpath(requested);
   } catch (err) {
     return describeFsError(err, "read", requested);
   }
-
-  // Check again after resolution: a symlink inside the root may point outside it.
-  if (rootDir !== undefined && !isInside(rootDir, real)) {
-    // Don't echo `real`: it would disclose where outside the root the link points.
+  // Don't echo `real`: it would disclose where outside the root the link points.
+  if (!isInside(realRoot, real)) {
     return `Path traversal blocked: ${requested} is a symlink that resolves outside SURGICAL_ROOT_DIR (${rootDir})`;
   }
   return { path: real };
+}
+
+async function resolveUnsandboxed(requested: string): Promise<string | { path: string }> {
+  try {
+    return { path: await fs.realpath(requested) };
+  } catch (err) {
+    return describeFsError(err, "read", requested);
+  }
 }
 
 async function loadFile(filePath: string, maxFileBytes: number): Promise<FileState | string> {
@@ -318,11 +333,12 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
 
 /** Fills line numbers and context for every applied replacement from the final content. */
 function finalizeApplied(state: FileState): void {
+  const redact = redactorFor(state.filePath);
   const lines = state.content.split("\n");
   for (const [i, applied] of state.applied.entries()) {
     const span = state.spans[i]!;
     applied.line = lineAt(state.content, span.start);
-    applied.context = contextAround(lines, state.content, span);
+    applied.context = contextAround(lines, state.content, span, redact);
   }
 }
 
@@ -422,10 +438,39 @@ export async function surgicalTransaction(
   operations: readonly Operation[],
   options: TransactionOptions = {},
 ): Promise<TransactionResult> {
-  const limits: Limits = { ...DEFAULT_LIMITS, ...options.limits };
+  const limits = normalizeLimits(options.limits);
+  if (typeof limits === "string") {
+    return { ok: false, error: capDiagnostic(`${limits} ${NOTHING_WRITTEN}`, DEFAULT_LIMITS.maxDiagnosticChars) };
+  }
+  const sandboxError = checkSandboxOptions(options);
+  if (sandboxError !== undefined) return { ok: false, error: `${sandboxError} ${NOTHING_WRITTEN}` };
   const result = await runTransaction(operations, options, limits);
   if (result.ok) return result;
   return { ok: false, error: capDiagnostic(result.error, limits.maxDiagnosticChars) };
+}
+
+/** Fills omitted limits with defaults; rejects anything that is not a non-negative safe integer. */
+export function normalizeLimits(overrides: Partial<Limits> | undefined): Limits | string {
+  const limits: Limits = { ...DEFAULT_LIMITS };
+  for (const key of Object.keys(DEFAULT_LIMITS) as (keyof Limits)[]) {
+    const value: unknown = overrides?.[key];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+      return `Invalid limit ${key}: ${String(value)} (expected a non-negative integer).`;
+    }
+    limits[key] = value;
+  }
+  return limits;
+}
+
+function checkSandboxOptions(options: TransactionOptions): string | undefined {
+  if (options.rootDir !== undefined && options.unsafeNoRoot === true) {
+    return "rootDir and unsafeNoRoot are mutually exclusive.";
+  }
+  if (options.rootDir === undefined && options.unsafeNoRoot !== true) {
+    return "No sandbox: pass rootDir, or unsafeNoRoot: true to edit without one.";
+  }
+  return undefined;
 }
 
 /** Caps an error message while keeping the "No files were written." guarantee visible. */
@@ -521,7 +566,7 @@ async function runTransaction(
   const changes: FileChange[] = states.map((s) => ({
     filePath: s.filePath,
     applied: s.applied,
-    diff: unifiedDiff(s.original, s.content, s.filePath),
+    diff: unifiedDiff(s.original, s.content, s.filePath, undefined, redactorFor(s.filePath)),
   }));
 
   if (!dryRun) {
@@ -554,8 +599,10 @@ export function formatTransaction(result: Extract<TransactionResult, { ok: true 
   }
 
   const blocks = result.files.map((f) => {
+    const redact = redactorFor(f.filePath);
+    const safe = (text: string): string => preview(text.split("\n").map(redact).join("\n"), 60);
     const entries = f.applied.map((r) => {
-      const header = `    op #${r.operation} #${r.index} (line ${r.line}): ${preview(r.find, 60)} → ${preview(r.replace, 60)}`;
+      const header = `    op #${r.operation} #${r.index} (line ${r.line}): ${safe(r.find)} → ${safe(r.replace)}`;
       const context = r.context
         .split("\n")
         .map((l) => `      ${l}`)

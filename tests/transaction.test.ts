@@ -27,7 +27,7 @@ describe("surgicalTransaction (multi-file)", () => {
     const result = await surgicalTransaction([
       { file_path: fileA, replacements: [{ find: "port = 3000", replace: "port = 8080" }] },
       { file_path: fileB, replacements: [{ find: "listen(port)", replace: "listen(port, host)" }] },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -40,7 +40,7 @@ describe("surgicalTransaction (multi-file)", () => {
     const result = await surgicalTransaction([
       { file_path: fileA, replacements: [{ find: "port = 3000", replace: "port = 8080" }] },
       { file_path: fileB, replacements: [{ find: "nonexistent snippet xyz", replace: "x" }] },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -53,14 +53,14 @@ describe("surgicalTransaction (multi-file)", () => {
     const result = await surgicalTransaction([
       { file_path: fileA, replacements: [{ find: "3000", replace: "PORT" }] },
       { file_path: path.relative(process.cwd(), fileA), replacements: [{ find: "= PORT", replace: "= Number(PORT)" }] },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     assert.equal(readFileSync(fileA, "utf8"), "export const port = Number(PORT);\n");
   });
 
   test("inserts $& and $1 literally", async () => {
-    await surgicalTransaction([{ file_path: fileA, replacements: [{ find: "3000", replace: "'$&$1'" }] }]);
+    await surgicalTransaction([{ file_path: fileA, replacements: [{ find: "3000", replace: "'$&$1'" }] }], { unsafeNoRoot: true });
     assert.equal(readFileSync(fileA, "utf8"), "export const port = '$&$1';\n");
   });
 
@@ -68,7 +68,7 @@ describe("surgicalTransaction (multi-file)", () => {
     const result = await surgicalTransaction([
       { file_path: fileA, replacements: [{ find: "3000", replace: "1" }] },
       { file_path: path.join(dir, "missing.ts"), replacements: [{ find: "x", replace: "y" }] },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -80,7 +80,7 @@ describe("surgicalTransaction (multi-file)", () => {
     // A read-only directory blocks creating the temp file, so the commit must
     // fail before any original is replaced.
     chmodSync(dir, 0o555);
-    const result = await surgicalTransaction([{ file_path: fileA, replacements: [{ find: "3000", replace: "1" }] }]);
+    const result = await surgicalTransaction([{ file_path: fileA, replacements: [{ find: "3000", replace: "1" }] }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;

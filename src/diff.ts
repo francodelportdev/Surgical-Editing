@@ -77,7 +77,13 @@ function diffLines(a: readonly string[], b: readonly string[]): DiffOp[] {
 }
 
 /** Returns a unified diff of `before` → `after`, or "" if they are identical. */
-export function unifiedDiff(before: string, after: string, filePath: string, context = DEFAULT_CONTEXT): string {
+export function unifiedDiff(
+  before: string,
+  after: string,
+  filePath: string,
+  context = DEFAULT_CONTEXT,
+  redact: (line: string) => string = (line) => line,
+): string {
   if (before === after) return "";
   const ops = diffLines(before.split("\n"), after.split("\n"));
 
@@ -113,7 +119,7 @@ export function unifiedDiff(before: string, after: string, filePath: string, con
     const aStart = aCount === 0 ? aLineAt[start]! - 1 : aLineAt[start]!;
     const bStart = bCount === 0 ? bLineAt[start]! - 1 : bLineAt[start]!;
     out.push(`@@ -${aStart},${aCount} +${bStart},${bCount} @@`);
-    for (const op of hunk) out.push(`${op.kind}${op.text}`);
+    for (const op of hunk) out.push(`${op.kind}${redact(op.text)}`);
   }
 
   return out.join("\n");

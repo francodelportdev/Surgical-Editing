@@ -292,7 +292,7 @@ describe("H2: permission preservation", { skip: isWindows }, () => {
     chmodSync(file, mode);
     const previous = process.umask(mask);
     try {
-      const r = await surgicalTransaction([{ file_path: file, replacements: [{ find: "v = 1", replace: "v = 2" }] }]);
+      const r = await surgicalTransaction([{ file_path: file, replacements: [{ find: "v = 1", replace: "v = 2" }] }], { unsafeNoRoot: true });
       assert.equal(r.ok, true);
     } finally {
       process.umask(previous);

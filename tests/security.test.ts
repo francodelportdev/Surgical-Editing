@@ -77,7 +77,7 @@ describe("security hardening", () => {
     writeFileSync(target, "value = 1\n", "utf8");
     symlinkSync(target, link);
 
-    const result = await surgicalReplace(link, [{ find: "value = 1", replace: "value = 2" }]);
+    const result = await surgicalReplace(link, [{ find: "value = 1", replace: "value = 2" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     assert.equal(readFileSync(target, "utf8"), "value = 2\n");
@@ -90,7 +90,7 @@ describe("security hardening", () => {
       const bytes = Buffer.from([0x63, 0x61, 0x66, 0xe9, 0x0a]); // "café\n" in Latin-1
       writeFileSync(file, bytes);
 
-      const result = await surgicalReplace(file, [{ find: "caf", replace: "tea" }]);
+      const result = await surgicalReplace(file, [{ find: "caf", replace: "tea" }], { unsafeNoRoot: true });
 
       assert.equal(result.ok, false);
       if (result.ok) return;
@@ -103,7 +103,7 @@ describe("security hardening", () => {
       const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x41]);
       writeFileSync(file, bytes);
 
-      const result = await surgicalReplace(file, [{ find: "A", replace: "B" }]);
+      const result = await surgicalReplace(file, [{ find: "A", replace: "B" }], { unsafeNoRoot: true });
 
       assert.equal(result.ok, false);
       assert.deepEqual(readFileSync(file), bytes);
@@ -114,7 +114,7 @@ describe("security hardening", () => {
       writeFileSync(file, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from("first = 1\n", "utf8")]));
 
       // `find` anchored at the start proves the BOM is not part of the content.
-      const result = await surgicalReplace(file, [{ find: "first = 1", replace: "first = 2" }]);
+      const result = await surgicalReplace(file, [{ find: "first = 1", replace: "first = 2" }], { unsafeNoRoot: true });
 
       assert.equal(result.ok, true);
       const written = readFileSync(file);
@@ -144,7 +144,7 @@ describe("security hardening", () => {
     const result = await surgicalTransaction([
       { file_path: fileA, replacements: [{ find: "a = 1", replace: "a = 2" }] },
       { file_path: fileB, replacements: [{ find: "b = 1", replace: "b = 2" }] },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;

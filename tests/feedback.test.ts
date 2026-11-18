@@ -22,7 +22,7 @@ describe("agent feedback", () => {
   });
 
   test("ambiguity errors list the line of every occurrence", async () => {
-    const result = await surgicalReplace(file, [{ find: "= 1;", replace: "= 9;" }]);
+    const result = await surgicalReplace(file, [{ find: "= 1;", replace: "= 9;" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -31,7 +31,7 @@ describe("agent feedback", () => {
 
   test("ambiguity on a single line uses the singular", async () => {
     writeFileSync(file, "ab ab\n", "utf8");
-    const result = await surgicalReplace(file, [{ find: "ab", replace: "x" }]);
+    const result = await surgicalReplace(file, [{ find: "ab", replace: "x" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -39,7 +39,7 @@ describe("agent feedback", () => {
   });
 
   test("returns numbered context around each edit from the final content", async () => {
-    const result = await surgicalReplace(file, [{ find: "b = 2", replace: "b = 20" }]);
+    const result = await surgicalReplace(file, [{ find: "b = 2", replace: "b = 20" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -56,7 +56,7 @@ describe("agent feedback", () => {
           { find: "import x from 'x';", replace: "import x from 'x';\nimport y from 'y';\nimport z from 'z';" },
         ],
       },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -69,7 +69,7 @@ describe("agent feedback", () => {
 
   test("truncates the middle of large edited regions", async () => {
     const big = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
-    const result = await surgicalReplace(file, [{ find: "const b = 2;", replace: big }]);
+    const result = await surgicalReplace(file, [{ find: "const b = 2;", replace: big }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -79,7 +79,7 @@ describe("agent feedback", () => {
   });
 
   test("the success message includes the context", async () => {
-    const result = await surgicalTransaction([{ file_path: file, replacements: [{ find: "b = 2", replace: "b = 20" }] }]);
+    const result = await surgicalTransaction([{ file_path: file, replacements: [{ find: "b = 2", replace: "b = 20" }] }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;

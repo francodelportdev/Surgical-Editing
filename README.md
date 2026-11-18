@@ -77,6 +77,8 @@ With `"dry_run": true`, the tool runs every validation and returns a unified dif
  export const host = env.HOST;
 ```
 
+The diff is meant for review, not for `patch`/`git apply`: lines are redacted as described in [Secrets in responses](#secrets-in-responses), so it is not guaranteed to apply as a patch.
+
 ## How atomicity works
 
 1. Every file is read and every replacement is validated in memory. Any failure aborts the call before anything is written.
@@ -160,10 +162,29 @@ Every request is checked against these limits before any file is touched. Exceed
 ## Safety guarantees
 
 - **Symlinks:** edits are applied to the file the link points to, and the link stays intact.
-- **Secrets in diagnostics:** near-miss hints never show content from credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `.netrc`, anything under `.ssh/`, `.aws/`…); they report only the line number. In other files, likely secrets (`password=`, `api_key:`, bearer tokens, URL credentials, long opaque tokens) are replaced with `[REDACTED]`. This is pattern-based and best-effort. Success output and dry-run diffs still show the edited region.
 - **Permissions:** the exact permission bits, setuid/setgid/sticky included, are restored on the new file regardless of the server's umask.
 - **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
 - **Concurrent changes:** if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
+
+### Secrets in responses
+
+Everything the server returns is redacted line by line before it reaches the agent: near-miss hints, the numbered context of applied edits, the `find`/`replace` previews and dry-run diffs (removed, added and context lines alike). Only responses are redacted; the file on disk always receives the exact text the agent sent.
+
+- **Credential files** (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `.netrc`, `credentials`, anything under `.ssh/`, `.aws/`, `.gnupg/`…): keys and structure stay visible, values never do. `API_KEY=sk-live-…` is shown as `API_KEY=[REDACTED]`; lines that aren't `key = value` / `key: value` (such as PEM bodies) become `[REDACTED]`. Near-miss errors report only the line number.
+- **Other files:** only likely secrets are replaced with `[REDACTED]`: values of keys like `password`, `token`, `api_key`, `secret`; bearer/basic credentials; passwords in URLs; PEM headers; and long opaque tokens mixing letters and digits (24+ characters). Ordinary code stays verbatim.
+
+Redaction is pattern-based and best-effort: it can miss secrets that look like ordinary text (a short password with no telling key name) and can hide harmless long identifiers such as hashes.
+
+## Library API
+
+`surgicalTransaction(operations, options)` and `surgicalReplace(path, replacements, options)` can be imported from `dist/surgical.js`. They have no sandbox unless you ask for one, so a sandbox choice is required:
+
+- `rootDir`: restrict edits to this directory. It is canonicalized with `realpath`, so a root reached through a symlink (for example `/var` → `/private/var` on macOS) works with paths written either way.
+- `unsafeNoRoot: true`: edit anywhere the process can write.
+
+Passing neither, or both, fails with an error and writes nothing.
+
+`limits` accepts any subset of the [resource limits](#resource-limits). Omitted or `undefined` fields use the default; `0` means nothing is allowed; any other value that isn't a non-negative integer (`NaN`, `Infinity`, negatives, fractions, strings) rejects the call without touching files.
 
 ### Known limitations
 

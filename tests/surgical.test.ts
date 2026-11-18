@@ -23,7 +23,7 @@ describe("surgicalReplace", () => {
   });
 
   test("applies a unique replacement and writes it to disk", async () => {
-    const result = await surgicalReplace(file, [{ find: "\"world\"", replace: "\"surgeon\"" }]);
+    const result = await surgicalReplace(file, [{ find: "\"world\"", replace: "\"surgeon\"" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, true);
     if (!result.ok) return;
@@ -33,7 +33,7 @@ describe("surgicalReplace", () => {
   });
 
   test("fails on ambiguity when find appears more than once", async () => {
-    const result = await surgicalReplace(file, [{ find: "= 1", replace: "= 2" }]);
+    const result = await surgicalReplace(file, [{ find: "= 1", replace: "= 2" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -43,7 +43,7 @@ describe("surgicalReplace", () => {
   });
 
   test("fails when find does not appear in the file", async () => {
-    const result = await surgicalReplace(file, [{ find: "does not exist", replace: "x" }]);
+    const result = await surgicalReplace(file, [{ find: "does not exist", replace: "x" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -55,7 +55,7 @@ describe("surgicalReplace", () => {
     const result = await surgicalReplace(file, [
       { find: "const a = 1", replace: "const a = 99" },
       { find: "missing snippet", replace: "x" },
-    ]);
+    ], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;

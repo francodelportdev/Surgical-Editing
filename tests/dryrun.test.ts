@@ -24,7 +24,7 @@ describe("dry run", () => {
   test("returns a unified diff and does not touch the disk", async () => {
     const result = await surgicalTransaction(
       [{ file_path: file, replacements: [{ find: "retries = 3", replace: "retries = 5" }] }],
-      { dryRun: true },
+      { dryRun: true, unsafeNoRoot: true },
     );
 
     assert.equal(result.ok, true);
@@ -53,7 +53,7 @@ describe("dry run", () => {
   test("still fails validation on ambiguity", async () => {
     const result = await surgicalTransaction(
       [{ file_path: file, replacements: [{ find: "line", replace: "row" }] }],
-      { dryRun: true },
+      { dryRun: true, unsafeNoRoot: true },
     );
 
     assert.equal(result.ok, false);

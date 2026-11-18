@@ -1,11 +1,4 @@
-/**
- * Keeps secrets out of diagnostics. Error messages go to the model and often
- * to logs; a near-miss hint must never become a way to read credentials.
- *
- * Best-effort by nature: patterns cannot recognise every secret. Sensitive
- * files are therefore excluded from content excerpts entirely, and other
- * files are redacted line by line.
- */
+// Best-effort secret redaction for everything the server returns; see README "Secrets in responses".
 import path from "node:path";
 
 const SENSITIVE_NAMES = [
@@ -48,6 +41,23 @@ export function redactLine(line: string): string {
 
 export function redactText(text: string): string {
   return text.split("\n").map(redactLine).join("\n");
+}
+
+const KEY_VALUE = /^(\s*(?:export\s+)?["']?[\w.-]+["']?\s*[:=]\s*)(.*)$/;
+const SECTION_HEADER = /^\s*\[[^\]]*\]\s*$/;
+
+/** For sensitive files: keeps keys and structure, hides every value and any other content. */
+export function maskValues(line: string): string {
+  if (line.trim() === "" || SECTION_HEADER.test(line)) return line;
+  const match = KEY_VALUE.exec(line);
+  if (match === null) return REDACTED;
+  return match[2]!.trim() === "" ? match[1]! : `${match[1]!}${REDACTED}`;
+}
+
+export type LineRedactor = (line: string) => string;
+
+export function redactorFor(filePath: string): LineRedactor {
+  return isSensitivePath(filePath) ? maskValues : redactLine;
 }
 
 /** Caps a message at `max` characters, marking the cut. */

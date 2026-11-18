@@ -76,7 +76,7 @@ server.registerTool(
       return errorResult("Missing input: provide `operations` (or the legacy `file_path` + `replacements`).");
     }
 
-    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir, limits });
+    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir, unsafeNoRoot: config.unsafe, limits });
     if (!result.ok) return errorResult(result.error);
     return { content: [{ type: "text" as const, text: formatTransaction(result) }] };
   },

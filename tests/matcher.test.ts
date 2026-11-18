@@ -50,7 +50,7 @@ describe("fuzzy diagnostics in surgicalReplace errors", () => {
 
   test("includes the similar line in the agreed format", async () => {
     writeFileSync(file, SOURCE, "utf8");
-    const result = await surgicalReplace(file, [{ find: "const usrName = getUser();", replace: "x" }]);
+    const result = await surgicalReplace(file, [{ find: "const usrName = getUser();", replace: "x" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
@@ -60,7 +60,7 @@ describe("fuzzy diagnostics in surgicalReplace errors", () => {
 
   test("appends the line-ending hint", async () => {
     writeFileSync(file, SOURCE.replace(/\n/g, "\r\n"), "utf8");
-    const result = await surgicalReplace(file, [{ find: "main() {\n  const", replace: "x" }]);
+    const result = await surgicalReplace(file, [{ find: "main() {\n  const", replace: "x" }], { unsafeNoRoot: true });
 
     assert.equal(result.ok, false);
     if (result.ok) return;
