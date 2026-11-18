@@ -27,6 +27,13 @@ export const DEFAULT_THRESHOLD = 0.8;
 const MAX_NEEDLE_CHARS = 2_000;
 const MAX_CONTENT_CHARS = 2_000_000;
 const MAX_PREVIEW_LINE_CHARS = 160;
+// Character comparisons allowed per search (~0.3 s worst case); beyond it the suggestion is skipped.
+export const DEFAULT_FUZZY_BUDGET = 100_000_000;
+
+/** Remaining comparisons; shared across windows so the whole search is bounded. */
+interface Budget {
+  remaining: number;
+}
 
 function collapseWhitespace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
@@ -42,12 +49,13 @@ function collapseWhitespace(text: string): string {
  * the minimum of each DP row never decreases, so once a row's minimum passes
  * the budget no later row can come back under it.
  */
-export function substringDistance(needle: string, text: string, maxDist: number): number {
+export function substringDistance(needle: string, text: string, maxDist: number, budget?: Budget): number {
   const n = text.length;
   let prev = new Uint32Array(n + 1); // row 0: starting anywhere in text costs nothing
   let curr = new Uint32Array(n + 1);
 
   for (let i = 1; i <= needle.length; i++) {
+    if (budget !== undefined && (budget.remaining -= n) < 0) return Infinity;
     curr[0] = i;
     let rowMin = curr[0];
     const nc = needle.charCodeAt(i - 1);
@@ -84,7 +92,9 @@ export function findClosestMatch(
   content: string,
   needle: string,
   threshold: number = DEFAULT_THRESHOLD,
+  maxComparisons: number = DEFAULT_FUZZY_BUDGET,
 ): ClosestMatch | undefined {
+  const budget: Budget = { remaining: maxComparisons };
   if (needle.length === 0 || needle.length > MAX_NEEDLE_CHARS || content.length > MAX_CONTENT_CHARS) {
     return undefined;
   }
@@ -101,6 +111,7 @@ export function findClosestMatch(
   for (let start = 0; start + span <= fileLines.length; start++) {
     const window = fileLines.slice(start, start + span);
     const windowText = window.join("\n");
+    if ((budget.remaining -= windowText.length) < 0) return undefined;
     if (needleCollapsed.length > 0 && collapseWhitespace(windowText).includes(needleCollapsed)) {
       const hint =
         fileUsesCrlf !== needleUsesCrlf
@@ -119,7 +130,8 @@ export function findClosestMatch(
   for (let start = 0; start + span <= fileLines.length; start++) {
     const window = fileLines.slice(start, start + span);
     const windowText = window.join("\n").replace(/\r/g, "");
-    const dist = substringDistance(needleNormalized, windowText, bestDist);
+    const dist = substringDistance(needleNormalized, windowText, bestDist, budget);
+    if (budget.remaining < 0) return undefined;
     if (dist <= bestDist && (best === undefined || dist < bestDist)) {
       bestDist = dist;
       best = {

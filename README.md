@@ -50,6 +50,8 @@ Operation #0, Replacement #0 (/repo/src/app.ts): No exact match found. Line 12 c
 
 Ambiguous matches report how many times the snippet appears and on which lines (`appears 3 times (lines 4, 18, 52)`), so the agent knows which context to add.
 
+The similarity search has a fixed work budget. When a file or snippet is too large for it to finish quickly (for example a 2000-character snippet against a file with very long lines), the suggestion is skipped and only the main "not found" error is returned.
+
 ### Verifiable results
 
 On success, each replacement comes back with its final line number and a numbered excerpt of the result, so the agent can check its edit without re-reading the file:
@@ -158,6 +160,9 @@ Every request is checked against these limits before any file is touched. Exceed
 | Characters in one `find` | 100000 | `SURGICAL_MAX_FIND_CHARS` |
 | Characters in one `replace` | 1000000 | `SURGICAL_MAX_REPLACE_CHARS` |
 | Characters in an error message | 2000 | `SURGICAL_MAX_DIAGNOSTIC_CHARS` |
+| Work per transaction, in characters scanned | 1000000000 | `SURGICAL_MAX_WORK_CHARS` |
+
+Each replacement scans its whole file once, so the work of a transaction is roughly the sum, over every replacement, of the size of its file. A transaction above the budget (for example 1000 replacements on a 10 MB file) is rejected before any edit is applied, with a message that suggests fewer, larger replacements or several smaller transactions. The default keeps the worst accepted transaction at a few seconds on a typical machine.
 
 ## Safety guarantees
 
@@ -201,6 +206,7 @@ npm run dev        # run from source with tsx
 npm run build      # compile to dist/
 npm run typecheck  # type-check src/ and tests/
 npm test           # typecheck, then run the node:test suite
+npm run bench      # engine benchmark; pass another engine to compare: npm run bench -- path/to/surgical.ts
 ```
 
 ## License

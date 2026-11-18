@@ -20,6 +20,8 @@ export interface Limits {
   maxReplaceChars: number;
   /** Max characters of an error message returned to the agent. */
   maxDiagnosticChars: number;
+  /** Max characters scanned across the transaction: each replacement scans its whole file once. */
+  maxWorkChars: number;
 }
 
 export const DEFAULT_LIMITS: Readonly<Limits> = Object.freeze({
@@ -29,6 +31,7 @@ export const DEFAULT_LIMITS: Readonly<Limits> = Object.freeze({
   maxFindChars: 100_000,
   maxReplaceChars: 1_000_000,
   maxDiagnosticChars: 2_000,
+  maxWorkChars: 1_000_000_000,
 });
 
 /** Environment variable for each limit. */
@@ -39,6 +42,7 @@ export const LIMIT_ENV: Readonly<Record<keyof Limits, string>> = Object.freeze({
   maxFindChars: "SURGICAL_MAX_FIND_CHARS",
   maxReplaceChars: "SURGICAL_MAX_REPLACE_CHARS",
   maxDiagnosticChars: "SURGICAL_MAX_DIAGNOSTIC_CHARS",
+  maxWorkChars: "SURGICAL_MAX_WORK_CHARS",
 });
 
 export interface ServerConfig {

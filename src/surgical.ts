@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { DEFAULT_LIMITS, type Limits } from "./config.js";
 import { unifiedDiff } from "./diff.js";
+import { LineIndex, summarizeOccurrences } from "./lines.js";
 import { findClosestMatch } from "./matcher.js";
 import { isSensitivePath, redactorFor, redactText, truncate, type LineRedactor } from "./redact.js";
 
@@ -92,32 +93,9 @@ const CONTEXT_LINES = 1;
 const MAX_CONTEXT_REGION_LINES = 10;
 const MAX_LISTED_LINES = 10;
 
-/**
- * Offsets of every occurrence of `needle` in `haystack`, including overlapping
- * ones. We count overlaps on purpose: with "aa" inside "aaa" a non-overlapping
- * count would report 1 and hide a real ambiguity about where the edit lands.
- */
-function findOccurrences(haystack: string, needle: string): number[] {
-  const offsets: number[] = [];
-  let from = 0;
-  for (;;) {
-    const idx = haystack.indexOf(needle, from);
-    if (idx === -1) return offsets;
-    offsets.push(idx);
-    from = idx + 1;
-  }
-}
-
+/** Counts overlapping occurrences: "aa" appears twice in "aaa", which is a real ambiguity. */
 export function countOccurrences(haystack: string, needle: string): number {
-  return findOccurrences(haystack, needle).length;
-}
-
-function lineAt(content: string, offset: number): number {
-  let line = 1;
-  for (let i = 0; i < offset; i++) {
-    if (content.charCodeAt(i) === 10) line++;
-  }
-  return line;
+  return summarizeOccurrences(haystack, needle, 0).count;
 }
 
 /**
@@ -125,9 +103,9 @@ function lineAt(content: string, offset: number): number {
  * each side. Large regions keep only their head and tail: the agent already
  * knows the text it sent, it only needs to see the seams.
  */
-function contextAround(lines: readonly string[], content: string, span: Span, redact: LineRedactor): string {
-  const firstLine = lineAt(content, span.start);
-  const lastLine = lineAt(content, Math.max(span.start, span.end - 1));
+function contextAround(lines: readonly string[], index: LineIndex, span: Span, redact: LineRedactor): string {
+  const firstLine = index.lineAt(span.start);
+  const lastLine = index.lineAt(Math.max(span.start, span.end - 1));
   const from = Math.max(1, firstLine - CONTEXT_LINES);
   const to = Math.min(lines.length, lastLine + CONTEXT_LINES);
   const width = String(to).length;
@@ -281,6 +259,17 @@ function notFoundMessage(content: string, find: string, filePath: string): strin
   );
 }
 
+/** Says how often and on which lines `find` occurs, so the agent knows which context to add. */
+function ambiguityMessage(content: string, find: string): string {
+  const { count, distinctLines, listedLines } = summarizeOccurrences(content, find, MAX_LISTED_LINES);
+  const more = distinctLines > MAX_LISTED_LINES ? `, … +${distinctLines - MAX_LISTED_LINES} more` : "";
+  return (
+    `"find" text ${preview(find)} is ambiguous — it appears ${count} times ` +
+    `(line${distinctLines > 1 ? "s" : ""} ${listedLines.join(", ")}${more}). ` +
+    `Include more surrounding context so it matches exactly once.`
+  );
+}
+
 /**
  * Applies one replacement to the in-memory state, or returns why it can't be
  * applied. Never touches disk.
@@ -292,22 +281,10 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
   // Uniqueness is the core safety guarantee: if the LLM's snippet is
   // ambiguous we cannot know which occurrence it meant, and guessing could
   // silently corrupt the file.
-  const occurrences = findOccurrences(state.content, r.find);
-  if (occurrences.length === 0) return notFoundMessage(state.content, r.find, state.filePath);
-  if (occurrences.length > 1) {
-    // Listing where each occurrence lives tells the agent which context to add
-    // without re-reading the file.
-    const lines = [...new Set(occurrences.map((o) => lineAt(state.content, o)))];
-    const listed = lines.slice(0, MAX_LISTED_LINES).join(", ");
-    const more = lines.length > MAX_LISTED_LINES ? `, … +${lines.length - MAX_LISTED_LINES} more` : "";
-    return (
-      `"find" text ${preview(r.find)} is ambiguous — it appears ${occurrences.length} times ` +
-      `(line${lines.length > 1 ? "s" : ""} ${listed}${more}). ` +
-      `Include more surrounding context so it matches exactly once.`
-    );
-  }
+  const offset = state.content.indexOf(r.find);
+  if (offset === -1) return notFoundMessage(state.content, r.find, state.filePath);
+  if (state.content.indexOf(r.find, offset + 1) !== -1) return ambiguityMessage(state.content, r.find);
 
-  const offset = occurrences[0]!;
   const findEnd = offset + r.find.length;
   const delta = r.replace.length - r.find.length;
   // Splice by offset instead of String.prototype.replace so that "$&", "$1"
@@ -335,10 +312,11 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
 function finalizeApplied(state: FileState): void {
   const redact = redactorFor(state.filePath);
   const lines = state.content.split("\n");
+  const index = new LineIndex(state.content);
   for (const [i, applied] of state.applied.entries()) {
     const span = state.spans[i]!;
-    applied.line = lineAt(state.content, span.start);
-    applied.context = contextAround(lines, state.content, span, redact);
+    applied.line = index.lineAt(span.start);
+    applied.context = contextAround(lines, index, span, redact);
   }
 }
 
@@ -483,6 +461,14 @@ function capDiagnostic(error: string, max: number): string {
   return truncate(error, max);
 }
 
+function workBudgetMessage(work: number, limits: Limits): string {
+  return (
+    `Transaction too expensive: each replacement scans its whole file, so it needs ~${work} characters of work, ` +
+    `above the budget of ${limits.maxWorkChars} (SURGICAL_MAX_WORK_CHARS). ` +
+    `Use fewer, larger replacements per large file, or split the change into several transactions.`
+  );
+}
+
 /** Rejects oversized requests before any file is touched. */
 function checkRequestLimits(operations: readonly Operation[], limits: Limits): string | undefined {
   if (operations.length > limits.maxOperations) {
@@ -536,12 +522,21 @@ async function runTransaction(
     files.set(target.path, loaded);
   }
 
+  const estimatedWork = operations.reduce(
+    (sum, op, opIndex) => sum + op.replacements.length * files.get(resolved[opIndex]!)!.content.length,
+    0,
+  );
+  if (estimatedWork > limits.maxWorkChars) return { ok: false, error: `${workBudgetMessage(estimatedWork, limits)} ${NOTHING_WRITTEN}` };
+
+  let work = 0;
   for (const [opIndex, op] of operations.entries()) {
     const state = files.get(resolved[opIndex]!)!;
     if (op.replacements.length === 0) {
       return { ok: false, error: `Operation #${opIndex} (${state.filePath}): no replacements provided. ${NOTHING_WRITTEN}` };
     }
     for (const [index, replacement] of op.replacements.entries()) {
+      work += state.content.length;
+      if (work > limits.maxWorkChars) return { ok: false, error: `${workBudgetMessage(work, limits)} ${NOTHING_WRITTEN}` };
       const error = applyReplacement(state, opIndex, index, replacement);
       if (error !== undefined) {
         return {
