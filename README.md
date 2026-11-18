@@ -247,6 +247,10 @@ npm test           # typecheck, then run the node:test suite
 npm run bench      # engine benchmark; pass another engine to compare: npm run bench -- path/to/surgical.ts
 ```
 
+## Acknowledgements
+
+The security audits and hardening of this project were carried out with the help of Claude (Anthropic), working under the owner's review and approval.
+
 ## License
 
 MIT
