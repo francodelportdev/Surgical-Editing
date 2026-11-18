@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { linkSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, symlinkSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, test } from "node:test";
@@ -39,4 +39,16 @@ test("once the extra link is gone the file can be edited again", async () => {
   rmSync(path.join(dir, "a-link.txt"));
   const r = await surgicalTransaction([{ file_path: "a.txt", replacements: [{ find: "v = 1", replace: "v = 2" }] }], { rootDir: dir });
   assert.equal(r.ok, true);
+});
+
+test("dry runs and paths reached through a symlink are rejected the same way", async () => {
+  writeFileSync(path.join(dir, "a.txt"), "v = 1\n");
+  linkSync(path.join(dir, "a.txt"), path.join(dir, "a-link.txt"));
+  symlinkSync(path.join(dir, "a.txt"), path.join(dir, "alias.txt"));
+  for (const [file_path, dryRun] of [["a.txt", true], ["alias.txt", false]] as const) {
+    const r = await surgicalTransaction([{ file_path, replacements: [{ find: "v = 1", replace: "v = 2" }] }], { rootDir: dir, dryRun });
+    assert.equal(r.ok, false, file_path);
+    if (!r.ok) assert.match(r.error, /has 2 hard links/);
+  }
+  assert.equal(readFileSync(path.join(dir, "a.txt"), "utf8"), "v = 1\n");
 });

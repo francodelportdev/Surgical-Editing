@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { isSecretKey, redactLine } from "../src/redact.js";
+import { clipLine, isSecretKey, MAX_DISPLAY_LINE_CHARS, redactLine } from "../src/redact.js";
 import { formatTransaction, surgicalTransaction } from "../src/surgical.js";
 
 const REDACT_MODULE = pathToFileURL(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../src/redact.ts")).href;
@@ -164,5 +164,42 @@ describe("redaction marker guard", () => {
     writeFileSync(path.join(dir, "a.ts"), "x = 1\n");
     const r = await surgicalTransaction([{ file_path: "a.ts", replacements: [{ find: "x = 1", replace: "x = [redacted]" }] }], { rootDir: dir });
     assert.equal(r.ok, true);
+  });
+});
+
+describe("very long lines in responses", () => {
+  test("a file with a multi-megabyte line can be edited, and the response stays small", async () => {
+    const long = `const password = "hunter2"; const blob = "${"x".repeat(9 * 1024 * 1024)}";`;
+    writeFileSync(path.join(dir, "big.js"), `${long}\nconst marker = 1;\n`);
+    for (const dryRun of [true, false]) {
+      const r = await surgicalTransaction([{ file_path: "big.js", replacements: [{ find: "marker = 1", replace: "marker = 2" }] }], { rootDir: dir, dryRun });
+      assert.equal(r.ok, true, r.ok ? "" : r.error);
+      if (!r.ok) return;
+      const out = [formatTransaction(r), r.files[0]!.diff].join("\n");
+      assert.ok(out.length < 10_000, `response is ${out.length} characters`);
+      assert.match(out, /…\[\+\d+ chars\]/);
+      assert.doesNotMatch(out, /hunter2/);
+    }
+    assert.match(readFileSync(path.join(dir, "big.js"), "utf8"), /marker = 2/);
+  });
+
+  test("an edit inside the long line itself shows a clipped diff", async () => {
+    writeFileSync(path.join(dir, "min.js"), `var a=1;MARK;${"y".repeat(9 * 1024 * 1024)}\n`);
+    const r = await surgicalTransaction([{ file_path: "min.js", replacements: [{ find: "MARK", replace: "DONE" }] }], { rootDir: dir, dryRun: true });
+    assert.equal(r.ok, true, r.ok ? "" : r.error);
+    if (r.ok) {
+      assert.match(r.files[0]!.diff, /^-var a=1;MARK;…\[\+\d+ chars\]$/m);
+      assert.match(r.files[0]!.diff, /^\+var a=1;DONE;…\[\+\d+ chars\]$/m);
+    }
+  });
+
+  test("clipping never shows a fragment of a token that crosses the limit", () => {
+    const token = "9fK2mQ7xL4pR8sT1vW3yZ6aB5cD0eF2gH4iJ";
+    const line = "a ".repeat((MAX_DISPLAY_LINE_CHARS - 10) / 2) + token + " tail";
+    const { shown, hidden } = clipLine(line);
+    assert.ok(shown.length <= MAX_DISPLAY_LINE_CHARS);
+    assert.ok(!shown.includes(token.slice(0, 4)), shown.slice(-20));
+    assert.equal(shown.length + hidden, line.length);
+    assert.deepEqual(clipLine("short"), { shown: "short", hidden: 0 });
   });
 });

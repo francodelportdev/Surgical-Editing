@@ -94,7 +94,7 @@ The diff is meant for review, not for `patch`/`git apply`: lines are redacted as
 - Before its first rename, the transaction writes and flushes a copy of every original and a manifest (with SHA-256 hashes of the old and new content) to `<root>/.surgical-journal/<id>/`. The journal is deleted as soon as the transaction finishes. Single-file transactions don't need one, because one rename is already atomic.
 - At startup, before serving any request, the server looks for journals left by a crash. If every file already has its new content, the transaction is kept as complete. Otherwise each file that has its new content is restored from its copy, atomically. A file that someone changed after the crash is left as it is and reported. A journal whose manifest was never completely written means no file had been touched yet, so it is just discarded. Every outcome is printed on stderr.
 - The journal can't be edited through the tool, and a manifest that points outside the root is ignored.
-- Add `.surgical-journal/` to your `.gitignore`. It only exists while a transaction is running or after a crash.
+- Add `.surgical-journal/` to your `.gitignore`. It only exists while a transaction is running or after a crash. While it exists it holds copies of the original files, which may include secrets; it is readable only by the server's user (directories `0700`, files `0600`), and recovery deletes it.
 - The journal needs a sandbox root to live in: with `--unsafe-no-root` there is no journal, and multi-file transactions are atomic per file only across a crash.
 
 Temp files (`.<name>.<12 hex digits>.tmp`) that a crash leaves behind outside any journal are reported too. At startup the server scans the sandbox root (skipping `node_modules`, `.git` and the journal, up to 100,000 entries) and prints a warning listing them. It never deletes them: review them and delete them yourself.
@@ -197,6 +197,8 @@ Everything the server returns is redacted line by line before it reaches the age
   - long random-looking strings: 24+ characters mixing upper case, lower case and at least three separate runs of digits. Hex hashes (git SHAs, checksums), UUIDs, `sha512-…` integrity hashes, paths and ordinary identifiers stay verbatim.
 
 The same redaction applies to the `find` text echoed in "ambiguous" and "not found" errors. It runs in linear time, so long minified lines can't stall a response.
+
+**Long lines.** Each line a response shows is cut to 400 characters, at a word boundary so no piece of a long token appears, and marked `…[+N chars]`. This keeps responses small for minified files and data blobs.
 
 **Strict mode.** Set `SURGICAL_RESPONSE_CONTENT=none` (or pass `responseContent: "none"` to the library) to keep file content out of every response: diffs, context excerpts, `find`/`replace` previews and near-miss hints show only `[REDACTED]` lines, line numbers and counts. Use it when files may hold secrets that no pattern recognises. The default, `full`, returns redacted content as described above.
 

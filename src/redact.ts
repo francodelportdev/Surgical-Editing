@@ -144,9 +144,26 @@ export function hideLine(line: string): string {
   return line.trim() === "" ? line : REDACTED;
 }
 
+// Longest line a response shows; also keeps every regex on bounded input (multi-MB lines overflow V8's regex stack).
+export const MAX_DISPLAY_LINE_CHARS = 400;
+const TOKEN_CHAR = /[\w+=/.-]/;
+
+/** Cuts a long line at a word boundary within the display limit, so no fragment of a long token is ever shown. */
+export function clipLine(line: string): { shown: string; hidden: number } {
+  if (line.length <= MAX_DISPLAY_LINE_CHARS) return { shown: line, hidden: 0 };
+  let end = MAX_DISPLAY_LINE_CHARS;
+  if (TOKEN_CHAR.test(line[end]!)) {
+    while (end > 0 && TOKEN_CHAR.test(line[end - 1]!)) end--;
+  }
+  return { shown: line.slice(0, end), hidden: line.length - end };
+}
+
 export function redactorFor(filePath: string, responseContent: ResponseContent = "full"): LineRedactor {
-  if (responseContent === "none") return hideLine;
-  return isSensitivePath(filePath) ? maskValues : redactLine;
+  const redact = responseContent === "none" ? hideLine : isSensitivePath(filePath) ? maskValues : redactLine;
+  return (line) => {
+    const { shown, hidden } = clipLine(line);
+    return hidden === 0 ? redact(shown) : `${redact(shown)}…[+${hidden} chars]`;
+  };
 }
 
 /** Caps a message at `max` characters, marking the cut. */

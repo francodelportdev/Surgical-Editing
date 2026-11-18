@@ -71,6 +71,17 @@ describe("strict mode: SURGICAL_RESPONSE_CONTENT=none", () => {
     }
   });
 
+  test("sensitive files in strict mode hide keys too, not just values", async () => {
+    writeFileSync(path.join(dir, ".env"), "DEBUG=1\nAPI_KEY=sk-live-ABCDEF123456\n");
+    const r = await surgicalTransaction([{ file_path: ".env", replacements: [{ find: "DEBUG=1", replace: "DEBUG=0" }] }], {
+      rootDir: dir,
+      dryRun: true,
+      responseContent: "none",
+    });
+    const out = everythingReturned(r);
+    for (const word of ["API_KEY", "sk-live", "DEBUG"]) assert.ok(!out.includes(word), word);
+  });
+
   test("the default mode is unchanged", async () => {
     const r = await surgicalTransaction(edit("retries = 3", "retries = 5"), { rootDir: dir, dryRun: true });
     assert.equal(r.ok, true);
