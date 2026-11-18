@@ -169,7 +169,7 @@ Each replacement scans its whole file once, so the work of a transaction is roug
 - **Symlinks:** edits are applied to the file the link points to, and the link stays intact.
 - **Permissions:** the exact permission bits, setuid/setgid/sticky included, are restored on the new file regardless of the server's umask.
 - **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
-- **Concurrent changes:** if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
+- **Concurrent changes:** transactions handled by the same server process never run at the same time on the same physical file (symlinks and different relative paths included): the second one waits, then reads the result of the first. Files are locked in a fixed order, so multi-file transactions can't deadlock. Against other processes (an editor, another server, a build tool) protection is optimistic: if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
 
 ### Secrets in responses
 

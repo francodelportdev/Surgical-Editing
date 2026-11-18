@@ -469,6 +469,32 @@ function workBudgetMessage(work: number, limits: Limits): string {
   );
 }
 
+// Tail of each file's lock queue: transactions on the same physical file run one at a time within this process.
+const fileLocks = new Map<string, Promise<void>>();
+
+/** Locks every path in sorted order, so two transactions can never wait on each other in a cycle. */
+async function lockFiles(paths: readonly string[]): Promise<() => void> {
+  const releases: (() => void)[] = [];
+  for (const filePath of [...new Set(paths)].sort()) {
+    const previous = fileLocks.get(filePath) ?? Promise.resolve();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const tail = previous.then(() => held);
+    fileLocks.set(filePath, tail);
+    await previous;
+    releases.push(() => {
+      release();
+      if (fileLocks.get(filePath) === tail) fileLocks.delete(filePath);
+    });
+  }
+  return () => releases.forEach((release) => release());
+}
+
+/** Number of files with a held or queued lock; exposed so tests can check locks are always released. */
+export function pendingFileLocks(): number {
+  return fileLocks.size;
+}
+
 /** Rejects oversized requests before any file is touched. */
 function checkRequestLimits(operations: readonly Operation[], limits: Limits): string | undefined {
   if (operations.length > limits.maxOperations) {
@@ -502,24 +528,38 @@ async function runTransaction(
   const limitError = checkRequestLimits(operations, limits);
   if (limitError !== undefined) return { ok: false, error: `${limitError} ${NOTHING_WRITTEN}` };
 
-  // Several operations may target the same file (even via different relative
-  // paths or symlinks); keying by physical path makes them share one
-  // in-memory state so edits compose sequentially.
-  const files = new Map<string, FileState>();
   const resolved: string[] = [];
-
   for (const [opIndex, op] of operations.entries()) {
     const target = await resolveTarget(op.file_path, options.rootDir);
     if (typeof target === "string") {
       return { ok: false, error: `Operation #${opIndex}: ${target}. ${NOTHING_WRITTEN}` };
     }
     resolved.push(target.path);
-    if (files.has(target.path)) continue;
-    const loaded = await loadFile(target.path, limits.maxFileBytes);
+  }
+
+  const release = await lockFiles(resolved);
+  try {
+    return await loadApplyCommit(operations, resolved, limits, dryRun);
+  } finally {
+    release();
+  }
+}
+
+async function loadApplyCommit(
+  operations: readonly Operation[],
+  resolved: readonly string[],
+  limits: Limits,
+  dryRun: boolean,
+): Promise<TransactionResult> {
+  // Keyed by physical path so operations reaching one file through different paths compose sequentially.
+  const files = new Map<string, FileState>();
+  for (const [opIndex, filePath] of resolved.entries()) {
+    if (files.has(filePath)) continue;
+    const loaded = await loadFile(filePath, limits.maxFileBytes);
     if (typeof loaded === "string") {
-      return { ok: false, error: `Operation #${opIndex} (${target.path}): ${loaded} ${NOTHING_WRITTEN}` };
+      return { ok: false, error: `Operation #${opIndex} (${filePath}): ${loaded} ${NOTHING_WRITTEN}` };
     }
-    files.set(target.path, loaded);
+    files.set(filePath, loaded);
   }
 
   const estimatedWork = operations.reduce(
