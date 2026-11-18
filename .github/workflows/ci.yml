@@ -18,7 +18,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         # The test script passes a glob to `node --test`, which Node resolves itself from version 21 on.
-        node: [22, 24]
+        node: [22, 24, 26]
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5

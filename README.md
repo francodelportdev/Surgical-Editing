@@ -101,6 +101,8 @@ Temp files (`.<name>.<12 hex digits>.tmp`) that a crash leaves behind outside an
 
 ## Installation
 
+Requires Node.js 22 or later.
+
 ```bash
 git clone <repo> surgical-editing
 cd surgical-editing
@@ -234,7 +236,7 @@ These come from Node.js and POSIX file semantics. They are documented on purpose
 
 ## Development
 
-CI runs the full test suite on Linux, macOS and Windows with Node 22 and 24 (`.github/workflows/ci.yml`).
+CI runs the full test suite on Linux, macOS and Windows with Node 22, 24 and 26 (`.github/workflows/ci.yml`).
 
 
 ```bash
