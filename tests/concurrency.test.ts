@@ -67,13 +67,18 @@ describe("C1: concurrent transactions in one process", () => {
     }
   });
 
-  test("a transaction that conflicts with an earlier one fails cleanly instead of overwriting it", async () => {
-    writeFileSync(path.join(dir, "a.txt"), "x = 1\n");
-    const [first, second] = await Promise.all([run(edit("a.txt", "x = 1", "x = 2")), run(edit("a.txt", "x = 1", "x = 3"))]);
-    assert.equal(first.ok, true);
-    assert.equal(second.ok, false);
-    if (!second.ok) assert.match(second.error, /No exact match found|was not found/);
-    assert.equal(read("a.txt"), "x = 2\n");
+  test("of two conflicting transactions exactly one wins and the other fails cleanly instead of overwriting it", async () => {
+    // Which one takes the lock first depends on async path resolution, so the test checks the guarantee, not the order.
+    for (let trial = 0; trial < 50; trial++) {
+      writeFileSync(path.join(dir, "a.txt"), "x = 1\n");
+      const results = await Promise.all([run(edit("a.txt", "x = 1", "x = 2")), run(edit("a.txt", "x = 1", "x = 3"))]);
+      const winners = results.flatMap((r, i) => (r.ok ? [i] : []));
+      assert.equal(winners.length, 1, `trial ${trial}: exactly one transaction must win`);
+      const loser = results[1 - winners[0]!]!;
+      if (!loser.ok) assert.match(loser.error, /No exact match found|was not found/);
+      assert.equal(read("a.txt"), winners[0] === 0 ? "x = 2\n" : "x = 3\n");
+    }
+    assert.equal(pendingFileLocks(), 0);
   });
 
   test("failed transactions release their locks", async () => {
