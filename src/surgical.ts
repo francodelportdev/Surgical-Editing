@@ -1,11 +1,12 @@
-import { randomBytes } from "node:crypto";
 // Accessed as `fs.*` (not destructured) so tests can intercept calls with mock.method.
 import fs from "node:fs/promises";
 import path from "node:path";
-import { DEFAULT_LIMITS, type Limits } from "./config.js";
+import { DEFAULT_LIMITS, RESPONSE_CONTENT_VALUES, type Limits, type ResponseContent } from "./config.js";
 import { unifiedDiff } from "./diff.js";
 import { LineIndex, summarizeOccurrences } from "./lines.js";
 import { findClosestMatch } from "./matcher.js";
+import { beginJournal, journalRoot, type Journal } from "./journal.js";
+import { isInside, syncDirectories as syncDirectoryList, tempPathFor } from "./paths.js";
 import {
   containsRedactionMarker,
   isSensitivePath,
@@ -36,6 +37,8 @@ export interface TransactionOptions {
   rootDir?: string;
   /** Required instead of `rootDir` to run without a sandbox. */
   unsafeNoRoot?: boolean;
+  /** "none" keeps file content out of results and errors; defaults to "full" (redacted content). */
+  responseContent?: ResponseContent;
   /** Resource limits; unspecified fields use DEFAULT_LIMITS. */
   limits?: Partial<Limits>;
 }
@@ -84,6 +87,7 @@ interface FileState {
   size: number;
   /** Identity of the file and its directory when read; any swap before the rename aborts the commit. */
   identity: FileIdentity;
+  responseContent: ResponseContent;
   applied: AppliedReplacement[];
   /** Offsets of each applied replacement in `content`, parallel to `applied`. */
   spans: Span[];
@@ -177,15 +181,6 @@ function describeFsError(err: unknown, action: string, filePath: string): string
   }
 }
 
-/**
- * True if `target` is `root` or lies beneath it. Uses path.relative instead
- * of a string prefix check, which would wrongly accept "/srv/app-evil" for
- * the root "/srv/app".
- */
-function isInside(root: string, target: string): boolean {
-  const rel = path.relative(root, target);
-  return rel === "" || (rel !== ".." && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
-}
 
 function encode(state: FileState): Buffer {
   const body = Buffer.from(state.content, "utf8");
@@ -224,6 +219,9 @@ async function resolveTarget(rawPath: string, sandbox: Sandbox | undefined): Pro
   // Don't echo `real`: it would disclose where outside the root the link points.
   if (!isInside(realRoot, real)) {
     return `Path traversal blocked: ${requested} is a symlink that resolves outside SURGICAL_ROOT_DIR (${rootDir})`;
+  }
+  if (isInside(journalRoot(realRoot), real)) {
+    return `Path blocked: ${requested} is inside the crash-recovery journal, which only the server may change`;
   }
   return { path: real };
 }
@@ -277,7 +275,12 @@ async function verifyIdentity(state: FileState, sandbox: Sandbox | undefined): P
   return undefined;
 }
 
-async function loadFile(filePath: string, maxFileBytes: number, sandbox: Sandbox | undefined): Promise<FileState | string> {
+async function loadFile(
+  filePath: string,
+  maxFileBytes: number,
+  sandbox: Sandbox | undefined,
+  responseContent: ResponseContent,
+): Promise<FileState | string> {
   let bytes: Buffer;
   let info: Awaited<ReturnType<typeof fs.stat>>;
   let file: Inode;
@@ -292,6 +295,12 @@ async function loadFile(filePath: string, maxFileBytes: number, sandbox: Sandbox
     try {
       const opened = await handle.stat();
       if (!sameInode(opened, info)) return pathChangedMessage(filePath, "it was replaced while being opened");
+      if (opened.nlink > 1) {
+        return (
+          `${filePath} has ${opened.nlink} hard links. Editing replaces the file, which would split them: the other ` +
+          `links would keep the old content. Remove the extra links first, or edit this file with another tool.`
+        );
+      }
       file = { dev: opened.dev, ino: opened.ino };
       bytes = await handle.readFile();
     } finally {
@@ -325,37 +334,39 @@ async function loadFile(filePath: string, maxFileBytes: number, sandbox: Sandbox
     mtimeMs: info.mtimeMs,
     size: info.size,
     identity: { file, directory },
+    responseContent,
     applied: [],
     spans: [],
   };
 }
 
-function notFoundMessage(content: string, find: string, filePath: string): string {
-  // Before giving up, point the agent at the closest region so it can correct
-  // its snippet without another full read of the file.
+function notFoundMessage(state: FileState, find: string): string {
+  const { content, filePath, responseContent } = state;
+  // Before giving up, point the agent at the closest region so it can correct its snippet without re-reading.
   const closest = findClosestMatch(content, find);
   if (closest) {
     const pct = Math.round(closest.similarity * 100);
     const hint = closest.hint ? ` Hint: ${closest.hint}` : "";
-    // The excerpt is file content the agent didn't send: never show it for
-    // credential files, and redact likely secrets everywhere else.
-    if (isSensitivePath(filePath)) {
-      return `No exact match found. Line ${closest.line} is ${pct}% similar (content hidden: sensitive file).${hint}`;
+    // The excerpt is file content the agent didn't send: hidden for credential files and in strict mode.
+    if (responseContent === "none" || isSensitivePath(filePath)) {
+      const why = responseContent === "none" ? "SURGICAL_RESPONSE_CONTENT=none" : "sensitive file";
+      return `No exact match found. Line ${closest.line} is ${pct}% similar (content hidden: ${why}).${hint}`;
     }
     return `No exact match found. Line ${closest.line} contains (${pct}% similar): '${redactText(closest.text)}'.${hint}`;
   }
   return (
-    `"find" text ${preview(redactSnippet(find, redactorFor(filePath)))} was not found. It must match the file exactly ` +
+    `"find" text ${preview(redactSnippet(find, redactorFor(filePath, responseContent)))} was not found. It must match the file exactly ` +
     `(whitespace, indentation and line endings included). Re-read the file and retry.`
   );
 }
 
 /** Says how often and on which lines `find` occurs, so the agent knows which context to add. */
-function ambiguityMessage(content: string, find: string, filePath: string): string {
+function ambiguityMessage(state: FileState, find: string): string {
+  const { content, filePath, responseContent } = state;
   const { count, distinctLines, listedLines } = summarizeOccurrences(content, find, MAX_LISTED_LINES);
   const more = distinctLines > MAX_LISTED_LINES ? `, … +${distinctLines - MAX_LISTED_LINES} more` : "";
   return (
-    `"find" text ${preview(redactSnippet(find, redactorFor(filePath)))} is ambiguous — it appears ${count} times ` +
+    `"find" text ${preview(redactSnippet(find, redactorFor(filePath, responseContent)))} is ambiguous — it appears ${count} times ` +
     `(line${distinctLines > 1 ? "s" : ""} ${listedLines.join(", ")}${more}). ` +
     `Include more surrounding context so it matches exactly once.`
   );
@@ -373,8 +384,8 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
   // ambiguous we cannot know which occurrence it meant, and guessing could
   // silently corrupt the file.
   const offset = state.content.indexOf(r.find);
-  if (offset === -1) return notFoundMessage(state.content, r.find, state.filePath);
-  if (state.content.indexOf(r.find, offset + 1) !== -1) return ambiguityMessage(state.content, r.find, state.filePath);
+  if (offset === -1) return notFoundMessage(state, r.find);
+  if (state.content.indexOf(r.find, offset + 1) !== -1) return ambiguityMessage(state, r.find);
 
   const findEnd = offset + r.find.length;
   const delta = r.replace.length - r.find.length;
@@ -401,7 +412,7 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
 
 /** Fills line numbers and context for every applied replacement from the final content. */
 function finalizeApplied(state: FileState): void {
-  const redact = redactorFor(state.filePath);
+  const redact = redactorFor(state.filePath, state.responseContent);
   const lines = state.content.split("\n");
   const index = new LineIndex(state.content);
   for (const [i, applied] of state.applied.entries()) {
@@ -411,9 +422,6 @@ function finalizeApplied(state: FileState): void {
   }
 }
 
-function tempPathFor(filePath: string): string {
-  return path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomBytes(6).toString("hex")}.tmp`);
-}
 
 /** Flushes the temp file's data and returns its inode, so a crash after the rename can't leave the target empty. */
 async function syncTemp(tmp: string): Promise<Inode> {
@@ -427,20 +435,9 @@ async function syncTemp(tmp: string): Promise<Inode> {
   }
 }
 
-/** Persists the renames done in each directory; best-effort because Windows and some filesystems can't fsync one. */
-async function syncDirectories(filePaths: readonly string[]): Promise<void> {
-  for (const directory of new Set(filePaths.map((p) => path.dirname(p)))) {
-    try {
-      const handle = await fs.open(directory, fs.constants.O_RDONLY);
-      try {
-        await handle.sync();
-      } finally {
-        await handle.close();
-      }
-    } catch {
-      // The files are already renamed: a failed directory flush can't be undone, only skipped.
-    }
-  }
+/** Persists the renames done next to each of these files. */
+function syncDirectories(filePaths: readonly string[]): Promise<void> {
+  return syncDirectoryList(filePaths.map((p) => path.dirname(p)));
 }
 
 function concurrentModification(filePath: string): string {
@@ -561,6 +558,21 @@ async function commit(states: readonly FileState[], sandbox: Sandbox | undefined
     }
   }
 
+  // Multi-file transactions keep a journal so a crash between renames can be undone at the next start.
+  let journal: Journal | undefined;
+  if (sandbox !== undefined && staged.length > 1) {
+    try {
+      journal = await beginJournal(
+        sandbox.realRoot,
+        staged.map(({ state, tmp }) => ({ target: state.filePath, tmp, mode: state.mode, original: state.originalBytes, next: encode(state) })),
+      );
+    } catch (err) {
+      await discardTemps();
+      const reason = err instanceof Error ? err.message : String(err);
+      return withLeftovers(`Could not write the crash-recovery journal (${reason}). Transaction aborted for safety.`);
+    }
+  }
+
   const swapped: StagedFile[] = [];
   for (const [i, entry] of staged.entries()) {
     try {
@@ -574,11 +586,19 @@ async function commit(states: readonly FileState[], sandbox: Sandbox | undefined
       const outcomes: [string, RestoreOutcome][] = [];
       for (const done of swapped) outcomes.push([done.state.filePath, await restoreOriginal(done, sandbox)]);
       await syncDirectories(swapped.map((done) => done.state.filePath));
+      // A failed restore keeps the journal so the next start can retry it.
+      let journalNote = "";
+      if (outcomes.some(([, outcome]) => outcome === "failed")) {
+        if (journal !== undefined) journalNote = " The crash-recovery journal was kept; the next server start will retry the restore.";
+      } else {
+        await journal?.finish().catch(() => undefined);
+      }
       const reason = err instanceof CommitAborted ? err.message : `${describeFsError(err, "write", entry.state.filePath)}.`;
-      return withLeftovers(`${reason}${rollbackNote(outcomes)}`);
+      return withLeftovers(`${reason}${rollbackNote(outcomes)}${journalNote}`);
     }
   }
   await syncDirectories(states.map((state) => state.filePath));
+  await journal?.finish().catch(() => undefined);
   return undefined;
 }
 
@@ -594,6 +614,9 @@ export async function surgicalTransaction(
   const limits = normalizeLimits(options.limits);
   if (typeof limits === "string") {
     return { ok: false, error: capDiagnostic(`${limits} ${NOTHING_WRITTEN}`, DEFAULT_LIMITS.maxDiagnosticChars) };
+  }
+  if (options.responseContent !== undefined && !RESPONSE_CONTENT_VALUES.includes(options.responseContent)) {
+    return { ok: false, error: `Invalid responseContent: ${String(options.responseContent)} (expected "full" or "none"). ${NOTHING_WRITTEN}` };
   }
   const sandboxError = checkSandboxOptions(options);
   if (sandboxError !== undefined) return { ok: false, error: `${sandboxError} ${NOTHING_WRITTEN}` };
@@ -732,7 +755,7 @@ async function runTransaction(
 
   const release = await lockFiles(resolved);
   try {
-    return await loadApplyCommit(operations, resolved, limits, dryRun, sandbox);
+    return await loadApplyCommit(operations, resolved, limits, dryRun, sandbox, options.responseContent ?? "full");
   } finally {
     release();
   }
@@ -744,12 +767,13 @@ async function loadApplyCommit(
   limits: Limits,
   dryRun: boolean,
   sandbox: Sandbox | undefined,
+  responseContent: ResponseContent,
 ): Promise<TransactionResult> {
   // Keyed by physical path so operations reaching one file through different paths compose sequentially.
   const files = new Map<string, FileState>();
   for (const [opIndex, filePath] of resolved.entries()) {
     if (files.has(filePath)) continue;
-    const loaded = await loadFile(filePath, limits.maxFileBytes, sandbox);
+    const loaded = await loadFile(filePath, limits.maxFileBytes, sandbox, responseContent);
     if (typeof loaded === "string") {
       return { ok: false, error: `Operation #${opIndex} (${filePath}): ${loaded} ${NOTHING_WRITTEN}` };
     }
@@ -795,7 +819,7 @@ async function loadApplyCommit(
   const changes: FileChange[] = states.map((s) => ({
     filePath: s.filePath,
     applied: s.applied,
-    diff: unifiedDiff(s.original, s.content, s.filePath, undefined, redactorFor(s.filePath)),
+    diff: unifiedDiff(s.original, s.content, s.filePath, undefined, redactorFor(s.filePath, s.responseContent)),
   }));
 
   if (!dryRun) {
@@ -818,7 +842,10 @@ export async function surgicalReplace(
   return { ok: true, filePath: file.filePath, applied: file.applied };
 }
 
-export function formatTransaction(result: Extract<TransactionResult, { ok: true }>): string {
+export function formatTransaction(
+  result: Extract<TransactionResult, { ok: true }>,
+  options: { responseContent?: ResponseContent } = {},
+): string {
   const total = result.files.reduce((n, f) => n + f.applied.length, 0);
   const summary = `${total} replacement(s) across ${result.files.length} file(s)`;
 
@@ -828,7 +855,7 @@ export function formatTransaction(result: Extract<TransactionResult, { ok: true 
   }
 
   const blocks = result.files.map((f) => {
-    const redact = redactorFor(f.filePath);
+    const redact = redactorFor(f.filePath, options.responseContent);
     const safe = (text: string): string => preview(redactSnippet(text, redact), 60);
     const entries = f.applied.map((r) => {
       const header = `    op #${r.operation} #${r.index} (line ${r.line}): ${safe(r.find)} → ${safe(r.replace)}`;

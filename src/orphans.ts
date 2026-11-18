@@ -1,9 +1,10 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { JOURNAL_DIR } from "./journal.js";
 
 // Name given by tempPathFor: ".<file>.<12 hex>.tmp".
 const TEMP_NAME = /^\..+\.[0-9a-f]{12}\.tmp$/;
-const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git"]);
+const SKIPPED_DIRECTORIES = new Set(["node_modules", ".git", JOURNAL_DIR]);
 
 export interface OrphanScan {
   found: string[];

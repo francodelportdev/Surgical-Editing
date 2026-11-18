@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { ConfigError, parseConfig, USAGE, type ServerConfig } from "./config.js";
+import { recoverJournals } from "./journal.js";
 import { findOrphanTemps, orphanWarning } from "./orphans.js";
 import { formatTransaction, surgicalTransaction, type Operation } from "./surgical.js";
 
@@ -22,7 +23,7 @@ function loadConfig(): ServerConfig {
 }
 
 const config = loadConfig();
-const { rootDir, limits } = config;
+const { rootDir, limits, responseContent } = config;
 
 const server = new McpServer({ name: "surgical-editing-server", version: "0.3.0" });
 
@@ -82,9 +83,9 @@ server.registerTool(
       return errorResult("Missing input: provide `operations` (or the legacy `file_path` + `replacements`).");
     }
 
-    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir, unsafeNoRoot: config.unsafe, limits });
+    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir, unsafeNoRoot: config.unsafe, limits, responseContent });
     if (!result.ok) return errorResult(result.error);
-    return { content: [{ type: "text" as const, text: formatTransaction(result) }] };
+    return { content: [{ type: "text" as const, text: formatTransaction(result, { responseContent }) }] };
   },
 );
 
@@ -93,6 +94,8 @@ function errorResult(text: string): { isError: true; content: { type: "text"; te
 }
 
 async function main(): Promise<void> {
+  // Before serving any request, so no transaction can touch a file that is still being recovered.
+  if (rootDir !== undefined) for (const line of await recoverJournals(rootDir)) console.error(`surgical-editing: ${line}`);
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout is reserved for the MCP protocol; log to stderr only.

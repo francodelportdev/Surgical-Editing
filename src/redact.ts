@@ -1,5 +1,6 @@
 // Best-effort secret redaction for everything the server returns; see README "Secrets in responses".
 import path from "node:path";
+import type { ResponseContent } from "./config.js";
 
 const SENSITIVE_NAMES = [
   /^\.env(\..*)?$/i,
@@ -138,7 +139,13 @@ export function maskValues(line: string): string {
 
 export type LineRedactor = (line: string) => string;
 
-export function redactorFor(filePath: string): LineRedactor {
+/** Strict mode: every non-blank line is hidden, so only the shape of the text (line numbers) remains. */
+export function hideLine(line: string): string {
+  return line.trim() === "" ? line : REDACTED;
+}
+
+export function redactorFor(filePath: string, responseContent: ResponseContent = "full"): LineRedactor {
+  if (responseContent === "none") return hideLine;
   return isSensitivePath(filePath) ? maskValues : redactLine;
 }
 

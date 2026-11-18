@@ -45,11 +45,25 @@ export const LIMIT_ENV: Readonly<Record<keyof Limits, string>> = Object.freeze({
   maxWorkChars: "SURGICAL_MAX_WORK_CHARS",
 });
 
+/** "none" keeps file content out of every response: only line numbers, counts and messages. */
+export type ResponseContent = "full" | "none";
+export const RESPONSE_CONTENT_VALUES: readonly ResponseContent[] = ["full", "none"];
+
 export interface ServerConfig {
   /** Physical sandbox root, or undefined only when `unsafe` is true. */
   rootDir: string | undefined;
   unsafe: boolean;
   limits: Limits;
+  responseContent: ResponseContent;
+}
+
+function parseResponseContent(env: NodeJS.ProcessEnv): ResponseContent {
+  const raw = env.SURGICAL_RESPONSE_CONTENT;
+  if (raw === undefined || raw === "") return "full";
+  if (!(RESPONSE_CONTENT_VALUES as readonly string[]).includes(raw)) {
+    throw new ConfigError(`Invalid SURGICAL_RESPONSE_CONTENT: ${JSON.stringify(raw)} (expected "full" or "none").`);
+  }
+  return raw as ResponseContent;
 }
 
 export class ConfigError extends Error {
@@ -60,7 +74,8 @@ export const USAGE =
   "Usage: surgical-editing [--root <dir> | --root=<dir> | --unsafe-no-root]\n" +
   "  --root <dir>        Sandbox root (default: SURGICAL_ROOT_DIR, else the current directory).\n" +
   "  --unsafe-no-root    Disable the sandbox. The server may then edit ANY file this user can write.\n" +
-  `  Limits (env): ${Object.values(LIMIT_ENV).join(", ")}`;
+  `  Limits (env): ${Object.values(LIMIT_ENV).join(", ")}\n` +
+  "  SURGICAL_RESPONSE_CONTENT=none keeps file content out of every response.";
 
 function resolveRoot(raw: string, source: string): string {
   let real: string;
@@ -123,16 +138,17 @@ export function parseConfig(args: readonly string[], env: NodeJS.ProcessEnv, cwd
   }
 
   const limits = parseLimits(env);
+  const responseContent = parseResponseContent(env);
 
   if (unsafe) {
     if (rootArg !== undefined) throw new ConfigError("--root and --unsafe-no-root are mutually exclusive.");
-    return { rootDir: undefined, unsafe: true, limits };
+    return { rootDir: undefined, unsafe: true, limits, responseContent };
   }
 
-  if (rootArg !== undefined) return { rootDir: resolveRoot(rootArg, "--root"), unsafe: false, limits };
+  if (rootArg !== undefined) return { rootDir: resolveRoot(rootArg, "--root"), unsafe: false, limits, responseContent };
   const envRoot = env.SURGICAL_ROOT_DIR;
   if (envRoot !== undefined && envRoot !== "") {
-    return { rootDir: resolveRoot(envRoot, "SURGICAL_ROOT_DIR"), unsafe: false, limits };
+    return { rootDir: resolveRoot(envRoot, "SURGICAL_ROOT_DIR"), unsafe: false, limits, responseContent };
   }
-  return { rootDir: resolveRoot(cwd, "the current directory"), unsafe: false, limits };
+  return { rootDir: resolveRoot(cwd, "the current directory"), unsafe: false, limits, responseContent };
 }

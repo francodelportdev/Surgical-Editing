@@ -89,7 +89,15 @@ The diff is meant for review, not for `patch`/`git apply`: lines are redacted as
 4. The temp files replace the originals via `rename()`, which is atomic per file on POSIX. If a rename still fails, files that were already replaced are rolled back, again through a temp file and `rename()`, so a restore is atomic too. A file is only restored if it still holds exactly what this transaction wrote; if someone edited it in the meantime, their edit is kept and the error names the file.
 5. After the renames, each affected directory is flushed too, so the renames survive a power loss. This step is best-effort: Windows and some filesystems can't flush a directory, and a failure there doesn't undo an applied transaction.
 
-**What survives a crash.** If the server process is killed or the machine loses power, each file is either entirely old or entirely new: never empty, truncated or mixed. A multi-file transaction interrupted between two renames, however, can end up partly applied, because there is no journal to finish or undo it after a restart. It also leaves its remaining temp files (`.<name>.<12 hex digits>.tmp`) next to their targets. At startup the server scans the sandbox root (skipping `node_modules` and `.git`, up to 100,000 entries) and prints a warning on stderr listing any it finds. It never deletes them: they hold the new content that was never applied, so review them and delete them yourself.
+**What survives a crash.** If the server process is killed or the machine loses power, each file is either entirely old or entirely new: never empty, truncated or mixed. A multi-file transaction is also all-or-nothing across a crash, through a journal:
+
+- Before its first rename, the transaction writes and flushes a copy of every original and a manifest (with SHA-256 hashes of the old and new content) to `<root>/.surgical-journal/<id>/`. The journal is deleted as soon as the transaction finishes. Single-file transactions don't need one, because one rename is already atomic.
+- At startup, before serving any request, the server looks for journals left by a crash. If every file already has its new content, the transaction is kept as complete. Otherwise each file that has its new content is restored from its copy, atomically. A file that someone changed after the crash is left as it is and reported. A journal whose manifest was never completely written means no file had been touched yet, so it is just discarded. Every outcome is printed on stderr.
+- The journal can't be edited through the tool, and a manifest that points outside the root is ignored.
+- Add `.surgical-journal/` to your `.gitignore`. It only exists while a transaction is running or after a crash.
+- The journal needs a sandbox root to live in: with `--unsafe-no-root` there is no journal, and multi-file transactions are atomic per file only across a crash.
+
+Temp files (`.<name>.<12 hex digits>.tmp`) that a crash leaves behind outside any journal are reported too. At startup the server scans the sandbox root (skipping `node_modules`, `.git` and the journal, up to 100,000 entries) and prints a warning listing them. It never deletes them: review them and delete them yourself.
 
 ## Installation
 
@@ -190,6 +198,8 @@ Everything the server returns is redacted line by line before it reaches the age
 
 The same redaction applies to the `find` text echoed in "ambiguous" and "not found" errors. It runs in linear time, so long minified lines can't stall a response.
 
+**Strict mode.** Set `SURGICAL_RESPONSE_CONTENT=none` (or pass `responseContent: "none"` to the library) to keep file content out of every response: diffs, context excerpts, `find`/`replace` previews and near-miss hints show only `[REDACTED]` lines, line numbers and counts. Use it when files may hold secrets that no pattern recognises. The default, `full`, returns redacted content as described above.
+
 Redaction is pattern-based and best-effort. It still misses secrets with no telling key name (`const p = "hunter2"`, `mysql -phunter2`), values on a different line from their key, and short tokens of unknown formats; occasionally it may hide a harmless random-looking string.
 
 **Redacted text can't be written back.** Any `find` or `replace` containing `[REDACTED]` is rejected before any file is touched, so an agent can't copy a redacted response into a file. The literal text `[REDACTED]` therefore can't be written with this tool.
@@ -205,6 +215,8 @@ The library result object (`files[].applied[].find` / `.replace`) is not redacte
 
 Passing neither, or both, fails with an error and writes nothing.
 
+With a `rootDir`, multi-file transactions keep a crash-recovery journal. The MCP server recovers it at startup; a program that uses the library directly should do the same once, before its first transaction: `await recoverJournals(rootDir)` from `dist/journal.js`, which returns one line per journal it handled.
+
 `limits` accepts any subset of the [resource limits](#resource-limits). Omitted or `undefined` fields use the default; `0` means nothing is allowed; any other value that isn't a non-negative integer (`NaN`, `Infinity`, negatives, fractions, strings) rejects the call without touching files.
 
 ### Known limitations
@@ -214,10 +226,14 @@ These come from Node.js and POSIX file semantics. They are documented on purpose
 - **Residual race window:** the checks run right before each `rename()`, but a write by another process that lands in the microseconds between the last check and the `rename()` can still be lost; the same applies to a rollback restore. Closing that gap needs advisory locks (`flock`), which Node.js does not expose portably, and which other programs would also have to honour.
 - **Swaps by a concurrent local process:** the checks above shrink the window to the time between the last check and the `rename()` call (microseconds), but can't close it: that needs `openat`/`renameat`-style calls, which Node.js doesn't expose. The sandbox is meant to contain the paths an agent sends, not a hostile process that already has write access inside the root and races the server.
 - **Windows:** there is no `O_NOFOLLOW`, so the "last component is not a symlink" protection on open is missing there; the identity checks before rename still apply. Creating symlinks on Windows requires extra privileges by default, which makes this attack harder.
-- **Hard links:** a file is replaced through temp file + `rename()`, so a file with several hard links is split. The edited path gets the new content and the other links keep the old content.
+- **Hard links:** a file is replaced through temp file + `rename()`, which would split a file with several hard links (the other links would keep the old content). Such files are therefore rejected with a clear error and nothing is written; remove the extra links first, or edit the file with another tool.
+- **A busy server answers late, not never:** the engine runs on Node's single thread, so while one transaction computes, other requests wait. The resource limits bound that wait to a few seconds per transaction (see [Resource limits](#resource-limits)). Running the engine in worker threads would remove the wait but would split the per-file locks and the journal across threads, adding more risk than it removes.
 - **File ownership:** permission bits are preserved, but the owner and group are not. If the server runs as a different user than the file's owner, the edited file will belong to the server's user.
 
 ## Development
+
+CI runs the full test suite on Linux, macOS and Windows with Node 22 and 24 (`.github/workflows/ci.yml`).
+
 
 ```bash
 npm run dev        # run from source with tsx
