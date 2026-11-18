@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { ConfigError, parseConfig, USAGE, type ServerConfig } from "./config.js";
+import { findOrphanTemps, orphanWarning } from "./orphans.js";
 import { formatTransaction, surgicalTransaction, type Operation } from "./surgical.js";
 
 /**
@@ -25,14 +26,18 @@ const { rootDir, limits } = config;
 
 const server = new McpServer({ name: "surgical-editing-server", version: "0.3.0" });
 
+// Schema caps are a defensive backstop at twice each limit; the engine enforces the limits with clearer messages.
+const backstop = (limit: number): number => Math.min(Number.MAX_SAFE_INTEGER, limit * 2);
+
 const replacementsSchema = z
   .array(
     z.object({
-      find: z.string().min(1).describe("Exact text to find. Must occur exactly once in the file."),
-      replace: z.string().describe("Exact text that replaces it."),
+      find: z.string().min(1).max(backstop(limits.maxFindChars)).describe("Exact text to find. Must occur exactly once in the file."),
+      replace: z.string().max(backstop(limits.maxReplaceChars)).describe("Exact text that replaces it."),
     }),
   )
-  .min(1);
+  .min(1)
+  .max(backstop(limits.maxReplacements));
 
 server.registerTool(
   "surgical_replace",
@@ -55,6 +60,7 @@ server.registerTool(
           }),
         )
         .min(1)
+        .max(backstop(limits.maxOperations))
         .optional()
         .describe("Edits to apply as one transaction. Operations on the same file compose in order."),
       file_path: z.string().min(1).optional().describe("Legacy single-file form; prefer `operations`."),
@@ -98,6 +104,11 @@ async function main(): Promise<void> {
     console.error("surgical-editing-server MCP server running on stdio (sandbox: DISABLED)");
   } else {
     console.error(`surgical-editing-server MCP server running on stdio (sandbox: ${rootDir})`);
+    // Runs after connecting so a large tree never delays the handshake.
+    void findOrphanTemps(rootDir!).then((scan) => {
+      const warning = orphanWarning(scan);
+      if (warning !== undefined) console.error(warning);
+    });
   }
 }
 

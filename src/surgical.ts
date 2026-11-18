@@ -6,7 +6,16 @@ import { DEFAULT_LIMITS, type Limits } from "./config.js";
 import { unifiedDiff } from "./diff.js";
 import { LineIndex, summarizeOccurrences } from "./lines.js";
 import { findClosestMatch } from "./matcher.js";
-import { isSensitivePath, redactorFor, redactText, truncate, type LineRedactor } from "./redact.js";
+import {
+  containsRedactionMarker,
+  isSensitivePath,
+  REDACTED,
+  redactorFor,
+  redactSnippet,
+  redactText,
+  truncate,
+  type LineRedactor,
+} from "./redact.js";
 
 export interface Replacement {
   find: string;
@@ -73,6 +82,8 @@ interface FileState {
   mode: number;
   mtimeMs: number;
   size: number;
+  /** Identity of the file and its directory when read; any swap before the rename aborts the commit. */
+  identity: FileIdentity;
   applied: AppliedReplacement[];
   /** Offsets of each applied replacement in `content`, parallel to `applied`. */
   spans: Span[];
@@ -82,6 +93,27 @@ interface Span {
   start: number;
   end: number;
 }
+
+interface Inode {
+  dev: number;
+  ino: number;
+}
+
+interface FileIdentity {
+  file: Inode;
+  directory: Inode;
+}
+
+/** Root canonicalized once per transaction, so every operation and the final checks use the same one. */
+interface Sandbox {
+  rootDir: string;
+  realRoot: string;
+}
+
+// Refuses to open a symlink as the final path component; Windows has no equivalent flag, see README.
+const O_NOFOLLOW = fs.constants.O_NOFOLLOW ?? 0;
+
+class CommitAborted extends Error {}
 
 const NOTHING_WRITTEN = "No files were written.";
 const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
@@ -136,6 +168,8 @@ function describeFsError(err: unknown, action: string, filePath: string): string
       return `Path is a directory, not a file: ${filePath}`;
     case "EROFS":
       return `Read-only file system, cannot ${action} ${filePath}`;
+    case "ELOOP":
+      return pathChangedMessage(filePath, "it was replaced by a symlink");
     default: {
       const msg = err instanceof Error ? err.message : String(err);
       return `Failed to ${action} ${filePath}: ${msg}`;
@@ -162,15 +196,18 @@ function encode(state: FileState): Buffer {
  * Resolves the requested path to the physical file that will be edited,
  * enforcing the sandbox. Returns an error message on failure.
  */
-async function resolveTarget(rawPath: string, rootDir: string | undefined): Promise<string | { path: string }> {
-  if (rootDir === undefined) return resolveUnsandboxed(path.resolve(rawPath));
-
-  let realRoot: string;
+async function openSandbox(rootDir: string): Promise<Sandbox | string> {
   try {
-    realRoot = await fs.realpath(rootDir);
+    return { rootDir, realRoot: await fs.realpath(rootDir) };
   } catch {
     return `Sandbox root is not accessible: ${rootDir}`;
   }
+}
+
+async function resolveTarget(rawPath: string, sandbox: Sandbox | undefined): Promise<string | { path: string }> {
+  if (sandbox === undefined) return resolveUnsandboxed(path.resolve(rawPath));
+
+  const { rootDir, realRoot } = sandbox;
   const requested = path.resolve(rootDir, rawPath);
   // Accept either spelling of the root (e.g. /var vs /private/var); the realpath check below is authoritative.
   if (!isInside(path.resolve(rootDir), requested) && !isInside(realRoot, requested)) {
@@ -199,9 +236,51 @@ async function resolveUnsandboxed(requested: string): Promise<string | { path: s
   }
 }
 
-async function loadFile(filePath: string, maxFileBytes: number): Promise<FileState | string> {
+function pathChangedMessage(filePath: string, detail: string): string {
+  return `Path changed during the transaction: ${filePath} (${detail}). Transaction aborted for safety.`;
+}
+
+const sameInode = (a: Inode, b: Inode): boolean => a.dev === b.dev && a.ino === b.ino;
+
+/** The directory must still be itself (no symlink swapped into its path) and, when sandboxed, inside the root. */
+async function directoryIdentity(directory: string, sandbox: Sandbox | undefined): Promise<Inode | string> {
+  try {
+    if ((await fs.realpath(directory)) !== directory) return pathChangedMessage(directory, "a directory in its path was replaced");
+    if (sandbox !== undefined) {
+      if ((await fs.realpath(sandbox.rootDir)) !== sandbox.realRoot) return pathChangedMessage(sandbox.rootDir, "the sandbox root moved");
+      if (!isInside(sandbox.realRoot, directory)) return pathChangedMessage(directory, "it is no longer inside the sandbox");
+    }
+    const info = await fs.lstat(directory);
+    return { dev: info.dev, ino: info.ino };
+  } catch (err) {
+    return pathChangedMessage(directory, describeFsError(err, "re-check", directory));
+  }
+}
+
+async function directoryUnchanged(state: FileState, sandbox: Sandbox | undefined): Promise<boolean> {
+  const directory = await directoryIdentity(path.dirname(state.filePath), sandbox);
+  return typeof directory !== "string" && sameInode(directory, state.identity.directory);
+}
+
+/** Confirms the path still names the very file and directory that were read. */
+async function verifyIdentity(state: FileState, sandbox: Sandbox | undefined): Promise<string | undefined> {
+  const directory = await directoryIdentity(path.dirname(state.filePath), sandbox);
+  if (typeof directory === "string") return directory;
+  if (!sameInode(directory, state.identity.directory)) return pathChangedMessage(state.filePath, "its directory was replaced");
+  try {
+    const info = await fs.lstat(state.filePath);
+    if (info.isSymbolicLink()) return pathChangedMessage(state.filePath, "it was replaced by a symlink");
+    if (!info.isFile() || !sameInode(info, state.identity.file)) return pathChangedMessage(state.filePath, "it was replaced by another file");
+  } catch (err) {
+    return pathChangedMessage(state.filePath, describeFsError(err, "re-check", state.filePath));
+  }
+  return undefined;
+}
+
+async function loadFile(filePath: string, maxFileBytes: number, sandbox: Sandbox | undefined): Promise<FileState | string> {
   let bytes: Buffer;
   let info: Awaited<ReturnType<typeof fs.stat>>;
+  let file: Inode;
   try {
     info = await fs.stat(filePath);
     if (!info.isFile()) return `Not a regular file: ${filePath}`;
@@ -209,10 +288,21 @@ async function loadFile(filePath: string, maxFileBytes: number): Promise<FileSta
     if (info.size > maxFileBytes) {
       return `File is ${info.size} bytes, above the ${maxFileBytes}-byte limit (SURGICAL_MAX_FILE_BYTES).`;
     }
-    bytes = await fs.readFile(filePath);
+    const handle = await fs.open(filePath, fs.constants.O_RDONLY | O_NOFOLLOW);
+    try {
+      const opened = await handle.stat();
+      if (!sameInode(opened, info)) return pathChangedMessage(filePath, "it was replaced while being opened");
+      file = { dev: opened.dev, ino: opened.ino };
+      bytes = await handle.readFile();
+    } finally {
+      await handle.close();
+    }
   } catch (err) {
     return describeFsError(err, "read", filePath);
   }
+  // Checked after reading: a directory swapped in before the open would have made us read another file.
+  const directory = await directoryIdentity(path.dirname(filePath), sandbox);
+  if (typeof directory === "string") return directory;
 
   const hasBom = bytes.subarray(0, 3).equals(UTF8_BOM);
   const body = hasBom ? bytes.subarray(3) : bytes;
@@ -234,6 +324,7 @@ async function loadFile(filePath: string, maxFileBytes: number): Promise<FileSta
     mode: info.mode,
     mtimeMs: info.mtimeMs,
     size: info.size,
+    identity: { file, directory },
     applied: [],
     spans: [],
   };
@@ -254,17 +345,17 @@ function notFoundMessage(content: string, find: string, filePath: string): strin
     return `No exact match found. Line ${closest.line} contains (${pct}% similar): '${redactText(closest.text)}'.${hint}`;
   }
   return (
-    `"find" text ${preview(find)} was not found. It must match the file exactly ` +
+    `"find" text ${preview(redactSnippet(find, redactorFor(filePath)))} was not found. It must match the file exactly ` +
     `(whitespace, indentation and line endings included). Re-read the file and retry.`
   );
 }
 
 /** Says how often and on which lines `find` occurs, so the agent knows which context to add. */
-function ambiguityMessage(content: string, find: string): string {
+function ambiguityMessage(content: string, find: string, filePath: string): string {
   const { count, distinctLines, listedLines } = summarizeOccurrences(content, find, MAX_LISTED_LINES);
   const more = distinctLines > MAX_LISTED_LINES ? `, … +${distinctLines - MAX_LISTED_LINES} more` : "";
   return (
-    `"find" text ${preview(find)} is ambiguous — it appears ${count} times ` +
+    `"find" text ${preview(redactSnippet(find, redactorFor(filePath)))} is ambiguous — it appears ${count} times ` +
     `(line${distinctLines > 1 ? "s" : ""} ${listedLines.join(", ")}${more}). ` +
     `Include more surrounding context so it matches exactly once.`
   );
@@ -283,7 +374,7 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
   // silently corrupt the file.
   const offset = state.content.indexOf(r.find);
   if (offset === -1) return notFoundMessage(state.content, r.find, state.filePath);
-  if (state.content.indexOf(r.find, offset + 1) !== -1) return ambiguityMessage(state.content, r.find);
+  if (state.content.indexOf(r.find, offset + 1) !== -1) return ambiguityMessage(state.content, r.find, state.filePath);
 
   const findEnd = offset + r.find.length;
   const delta = r.replace.length - r.find.length;
@@ -324,86 +415,170 @@ function tempPathFor(filePath: string): string {
   return path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomBytes(6).toString("hex")}.tmp`);
 }
 
-/**
- * Detects files modified by someone else since we read them. Compares size as
- * well as mtime because some filesystems only store mtime at 1–2 s resolution.
- */
-async function findConcurrentModification(states: readonly FileState[]): Promise<string | undefined> {
-  for (const state of states) {
+/** Flushes the temp file's data and returns its inode, so a crash after the rename can't leave the target empty. */
+async function syncTemp(tmp: string): Promise<Inode> {
+  const handle = await fs.open(tmp, fs.constants.O_RDWR | O_NOFOLLOW);
+  try {
+    await handle.sync();
+    const info = await handle.stat();
+    return { dev: info.dev, ino: info.ino };
+  } finally {
+    await handle.close();
+  }
+}
+
+/** Persists the renames done in each directory; best-effort because Windows and some filesystems can't fsync one. */
+async function syncDirectories(filePaths: readonly string[]): Promise<void> {
+  for (const directory of new Set(filePaths.map((p) => path.dirname(p)))) {
     try {
-      const now = await fs.stat(state.filePath);
-      if (now.mtimeMs !== state.mtimeMs || now.size !== state.size) {
-        return `Concurrent modification detected on ${state.filePath}. Transaction aborted for safety.`;
+      const handle = await fs.open(directory, fs.constants.O_RDONLY);
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
       }
-    } catch (err) {
-      return `${describeFsError(err, "re-check", state.filePath)}. Transaction aborted for safety.`;
+    } catch {
+      // The files are already renamed: a failed directory flush can't be undone, only skipped.
     }
+  }
+}
+
+function concurrentModification(filePath: string): string {
+  return `Concurrent modification detected on ${filePath}. Transaction aborted for safety.`;
+}
+
+/** Detects changes by anyone else since the read: identity, then mtime and size, then (optionally) the bytes themselves. */
+async function findConcurrentModification(
+  state: FileState,
+  sandbox: Sandbox | undefined,
+  compareContent: boolean,
+): Promise<string | undefined> {
+  const changed = await verifyIdentity(state, sandbox);
+  if (changed !== undefined) return changed;
+  try {
+    const now = await fs.stat(state.filePath);
+    // Size as well as mtime, because some filesystems store mtime at 1–2 s resolution.
+    if (now.mtimeMs !== state.mtimeMs || now.size !== state.size) return concurrentModification(state.filePath);
+    // The bytes too: rsync -t, cp -p or tar can rewrite a file keeping its size and mtime.
+    if (compareContent && !(await fs.readFile(state.filePath)).equals(state.originalBytes)) {
+      return concurrentModification(state.filePath);
+    }
+  } catch (err) {
+    return `${describeFsError(err, "re-check", state.filePath)}. Transaction aborted for safety.`;
   }
   return undefined;
 }
 
+interface StagedFile {
+  state: FileState;
+  tmp: string;
+  /** Inode of the temp file, which becomes the target's inode once renamed into place. */
+  inode?: Inode;
+}
+
+type RestoreOutcome = "restored" | "changed" | "failed";
+
+/** Puts the original bytes back atomically, but only if the file is still exactly what this transaction wrote. */
+async function restoreOriginal({ state, inode }: StagedFile, sandbox: Sandbox | undefined): Promise<RestoreOutcome> {
+  try {
+    if (!(await directoryUnchanged(state, sandbox))) return "failed";
+    const current = await fs.lstat(state.filePath);
+    if (current.isSymbolicLink() || inode === undefined || !sameInode(current, inode)) return "changed";
+    if (!(await fs.readFile(state.filePath)).equals(encode(state))) return "changed";
+    const tmp = tempPathFor(state.filePath);
+    try {
+      await fs.writeFile(tmp, state.originalBytes, { mode: state.mode, flag: "wx" });
+      await fs.chmod(tmp, state.mode & 0o7777);
+      await syncTemp(tmp);
+      await fs.rename(tmp, state.filePath);
+    } catch (err) {
+      await fs.unlink(tmp).catch(() => undefined);
+      throw err;
+    }
+    return "restored";
+  } catch {
+    return "failed";
+  }
+}
+
+function rollbackNote(outcomes: readonly [string, RestoreOutcome][]): string {
+  const pick = (kind: RestoreOutcome): string[] => outcomes.filter(([, o]) => o === kind).map(([p]) => p);
+  const [restored, changed, failed] = [pick("restored"), pick("changed"), pick("failed")];
+  let note = "";
+  if (failed.length > 0) note += ` WARNING: could not restore ${failed.join(", ")}; these files contain the new content.`;
+  if (changed.length > 0) {
+    note += ` WARNING: ${changed.join(", ")} changed again after being replaced, so they were left as they are instead of being restored; check them.`;
+  }
+  if (restored.length > 0) {
+    note += failed.length + changed.length === 0 ? " Files already updated were restored to their original content." : ` Restored: ${restored.join(", ")}.`;
+  }
+  return note;
+}
+
 /**
- * Two-phase commit across files. Phase 1 writes every new version to a temp
- * file next to its target, where nearly all I/O failures (permissions, disk
- * full) surface while the originals are still untouched. Phase 2 swaps them in
- * with rename(), which is atomic per file on POSIX. If a rename still fails we
- * restore the files already swapped, so a transaction never ends half-applied.
+ * Two-phase commit: stage every new version as a temp file next to its target (where most I/O errors surface while
+ * the originals are untouched), check nothing changed, then rename each into place, rolling back on failure.
  */
-async function commit(states: readonly FileState[]): Promise<string | undefined> {
-  const staged: { state: FileState; tmp: string }[] = [];
+async function commit(states: readonly FileState[], sandbox: Sandbox | undefined): Promise<string | undefined> {
+  const staged: StagedFile[] = [];
+  const leftBehind: string[] = [];
   const discardTemps = (from = 0): Promise<unknown> =>
-    Promise.all(staged.slice(from).map((s) => fs.unlink(s.tmp).catch(() => undefined)));
+    Promise.all(
+      staged.slice(from).map(async ({ state, tmp, inode }) => {
+        // Unlink only what is provably our temp file: after a swap the same name may resolve somewhere else.
+        const current = await fs.lstat(tmp).catch(() => undefined);
+        const ours = inode !== undefined ? current !== undefined && sameInode(current, inode) : await directoryUnchanged(state, sandbox);
+        if (ours) await fs.unlink(tmp).catch(() => undefined);
+        else if (inode !== undefined) leftBehind.push(tmp);
+      }),
+    );
+  const withLeftovers = (message: string): string =>
+    leftBehind.length === 0
+      ? message
+      : `${message} Temp files were left in place because their directory was moved: ${leftBehind.map((t) => path.basename(t)).join(", ")}.`;
 
   for (const state of states) {
-    // Register the temp path before writing: a failed writeFile can still
-    // leave a partial file behind that must be cleaned up.
-    const tmp = tempPathFor(state.filePath);
-    staged.push({ state, tmp });
+    // Registered before writing: a failed write can still leave a partial file to clean up.
+    const entry: StagedFile = { state, tmp: tempPathFor(state.filePath) };
+    staged.push(entry);
     try {
-      await fs.writeFile(tmp, encode(state), { mode: state.mode });
-      // The mode passed at creation is filtered by the umask (0666 → 0644
-      // under umask 022). chmod is not, so it restores the exact original
-      // bits, including setuid/setgid/sticky, rather than silently changing them.
-      await fs.chmod(tmp, state.mode & 0o7777);
+      // "wx" never follows or reuses an existing path, even one planted with this random name.
+      await fs.writeFile(entry.tmp, encode(state), { mode: state.mode, flag: "wx" });
+      // The creation mode is filtered by the umask; chmod restores the exact bits, setuid/setgid/sticky included.
+      await fs.chmod(entry.tmp, state.mode & 0o7777);
+      entry.inode = await syncTemp(entry.tmp);
     } catch (err) {
       await discardTemps();
-      return describeFsError(err, "write", state.filePath);
+      return withLeftovers(describeFsError(err, "write", state.filePath));
     }
   }
 
-  // Last check before the point of no return. Staging temps can take a while
-  // on large transactions; if anyone touched an original in the meantime, our
-  // edits were computed from stale content and would overwrite their changes.
-  const conflict = await findConcurrentModification(states);
-  if (conflict !== undefined) {
-    await discardTemps();
-    return conflict;
+  for (const state of states) {
+    const conflict = await findConcurrentModification(state, sandbox, true);
+    if (conflict !== undefined) {
+      await discardTemps();
+      return withLeftovers(conflict);
+    }
   }
 
-  const swapped: FileState[] = [];
-  for (const [i, { state, tmp }] of staged.entries()) {
+  const swapped: StagedFile[] = [];
+  for (const [i, entry] of staged.entries()) {
     try {
-      await fs.rename(tmp, state.filePath);
-      swapped.push(state);
+      // Re-checked right before each rename to keep the race window as small as Node allows.
+      const conflict = await findConcurrentModification(entry.state, sandbox, false);
+      if (conflict !== undefined) throw new CommitAborted(conflict);
+      await fs.rename(entry.tmp, entry.state.filePath);
+      swapped.push(entry);
     } catch (err) {
       await discardTemps(i);
-      const failedRestores: string[] = [];
-      for (const done of swapped) {
-        try {
-          await fs.writeFile(done.filePath, done.originalBytes, { mode: done.mode });
-        } catch {
-          failedRestores.push(done.filePath);
-        }
-      }
-      const restoreNote =
-        failedRestores.length > 0
-          ? ` WARNING: could not restore ${failedRestores.join(", ")}; these files contain the new content.`
-          : swapped.length > 0
-            ? " Files already updated were restored to their original content."
-            : "";
-      return `${describeFsError(err, "write", state.filePath)}.${restoreNote}`;
+      const outcomes: [string, RestoreOutcome][] = [];
+      for (const done of swapped) outcomes.push([done.state.filePath, await restoreOriginal(done, sandbox)]);
+      await syncDirectories(swapped.map((done) => done.state.filePath));
+      const reason = err instanceof CommitAborted ? err.message : `${describeFsError(err, "write", entry.state.filePath)}.`;
+      return withLeftovers(`${reason}${rollbackNote(outcomes)}`);
     }
   }
+  await syncDirectories(states.map((state) => state.filePath));
   return undefined;
 }
 
@@ -495,6 +670,21 @@ export function pendingFileLocks(): number {
   return fileLocks.size;
 }
 
+/** Rejects edits that would copy a redacted response back into a file. */
+function checkRedactionMarker(operations: readonly Operation[]): string | undefined {
+  for (const [opIndex, op] of operations.entries()) {
+    for (const [index, r] of op.replacements.entries()) {
+      const field = containsRedactionMarker(r.find) ? "find" : containsRedactionMarker(r.replace) ? "replace" : undefined;
+      if (field === undefined) continue;
+      return (
+        `Operation #${opIndex}, Replacement #${index}: "${field}" contains ${REDACTED}, the marker this server uses to hide secrets ` +
+        `in its responses; it is not the file's real text. Use the real value, or ask the user for it.`
+      );
+    }
+  }
+  return undefined;
+}
+
 /** Rejects oversized requests before any file is touched. */
 function checkRequestLimits(operations: readonly Operation[], limits: Limits): string | undefined {
   if (operations.length > limits.maxOperations) {
@@ -525,12 +715,15 @@ async function runTransaction(
 ): Promise<TransactionResult> {
   const dryRun = options.dryRun ?? false;
   if (operations.length === 0) return { ok: false, error: `No operations provided. ${NOTHING_WRITTEN}` };
-  const limitError = checkRequestLimits(operations, limits);
+  const limitError = checkRequestLimits(operations, limits) ?? checkRedactionMarker(operations);
   if (limitError !== undefined) return { ok: false, error: `${limitError} ${NOTHING_WRITTEN}` };
+
+  const sandbox = options.rootDir === undefined ? undefined : await openSandbox(options.rootDir);
+  if (typeof sandbox === "string") return { ok: false, error: `${sandbox}. ${NOTHING_WRITTEN}` };
 
   const resolved: string[] = [];
   for (const [opIndex, op] of operations.entries()) {
-    const target = await resolveTarget(op.file_path, options.rootDir);
+    const target = await resolveTarget(op.file_path, sandbox);
     if (typeof target === "string") {
       return { ok: false, error: `Operation #${opIndex}: ${target}. ${NOTHING_WRITTEN}` };
     }
@@ -539,7 +732,7 @@ async function runTransaction(
 
   const release = await lockFiles(resolved);
   try {
-    return await loadApplyCommit(operations, resolved, limits, dryRun);
+    return await loadApplyCommit(operations, resolved, limits, dryRun, sandbox);
   } finally {
     release();
   }
@@ -550,12 +743,13 @@ async function loadApplyCommit(
   resolved: readonly string[],
   limits: Limits,
   dryRun: boolean,
+  sandbox: Sandbox | undefined,
 ): Promise<TransactionResult> {
   // Keyed by physical path so operations reaching one file through different paths compose sequentially.
   const files = new Map<string, FileState>();
   for (const [opIndex, filePath] of resolved.entries()) {
     if (files.has(filePath)) continue;
-    const loaded = await loadFile(filePath, limits.maxFileBytes);
+    const loaded = await loadFile(filePath, limits.maxFileBytes, sandbox);
     if (typeof loaded === "string") {
       return { ok: false, error: `Operation #${opIndex} (${filePath}): ${loaded} ${NOTHING_WRITTEN}` };
     }
@@ -605,7 +799,7 @@ async function loadApplyCommit(
   }));
 
   if (!dryRun) {
-    const error = await commit(states.filter((s) => s.content !== s.original));
+    const error = await commit(states.filter((s) => s.content !== s.original), sandbox);
     if (error !== undefined) return { ok: false, error };
   }
 
@@ -635,7 +829,7 @@ export function formatTransaction(result: Extract<TransactionResult, { ok: true 
 
   const blocks = result.files.map((f) => {
     const redact = redactorFor(f.filePath);
-    const safe = (text: string): string => preview(text.split("\n").map(redact).join("\n"), 60);
+    const safe = (text: string): string => preview(redactSnippet(text, redact), 60);
     const entries = f.applied.map((r) => {
       const header = `    op #${r.operation} #${r.index} (line ${r.line}): ${safe(r.find)} → ${safe(r.replace)}`;
       const context = r.context

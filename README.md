@@ -85,7 +85,8 @@ The diff is meant for review, not for `patch`/`git apply`: lines are redacted as
 
 1. Every file is read and every replacement is validated in memory. Any failure aborts the call before anything is written.
 2. Each new version is written to a temp file next to its target. Most I/O failures (permissions, a full disk) happen at this step, while the originals are still untouched. If one fails, all temp files are removed.
-3. The temp files replace the originals via `rename()`, which is atomic per file on POSIX. If a rename still fails, files that were already replaced are restored to their original content.
+3. Before the first rename, every file is checked against what was read: same file (inode), same mtime and size, and the same bytes. Right before each rename the cheap checks run again.
+4. The temp files replace the originals via `rename()`, which is atomic per file on POSIX. If a rename still fails, files that were already replaced are rolled back, again through a temp file and `rename()`, so a restore is atomic too. A file is only restored if it still holds exactly what this transaction wrote; if someone edited it in the meantime, their edit is kept and the error names the file.
 
 ## Installation
 
@@ -167,18 +168,28 @@ Each replacement scans its whole file once, so the work of a transaction is roug
 ## Safety guarantees
 
 - **Symlinks:** edits are applied to the file the link points to, and the link stays intact.
+- **Paths swapped during a transaction:** the sandbox root is resolved once per transaction. The file is opened without following a symlink in its last component, and after reading, its directory must still resolve to itself inside the root. Before any rename, and again right before each one, the server checks that the root, the directory and the file are the very same objects it read (same device and inode, not a symlink). If anything was swapped, the transaction is aborted and files already replaced are restored. This applies to dry runs too, so a diff never shows content read through a swapped path. Temp files are created exclusively (`O_EXCL`) and are only deleted when the path still names the temp file the server created; one that ended up in a directory that was moved away is left there, and the error names it.
 - **Permissions:** the exact permission bits, setuid/setgid/sticky included, are restored on the new file regardless of the server's umask.
 - **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
-- **Concurrent changes:** transactions handled by the same server process never run at the same time on the same physical file (symlinks and different relative paths included): the second one waits, then reads the result of the first. Files are locked in a fixed order, so multi-file transactions can't deadlock. Against other processes (an editor, another server, a build tool) protection is optimistic: if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
+- **Concurrent changes:** transactions handled by the same server process never run at the same time on the same physical file (symlinks and different relative paths included): the second one waits, then reads the result of the first. Files are locked in a fixed order, so multi-file transactions can't deadlock. Against other processes (an editor, another server, a build tool) protection is optimistic: if a file's content, mtime, size or identity changes between the read and the commit, the whole transaction is aborted. Comparing the bytes catches tools that rewrite a file while preserving its size and mtime (`rsync -t`, `cp -p`, `tar`).
 
 ### Secrets in responses
 
 Everything the server returns is redacted line by line before it reaches the agent: near-miss hints, the numbered context of applied edits, the `find`/`replace` previews and dry-run diffs (removed, added and context lines alike). Only responses are redacted; the file on disk always receives the exact text the agent sent.
 
 - **Credential files** (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `.netrc`, `credentials`, anything under `.ssh/`, `.aws/`, `.gnupg/`…): keys and structure stay visible, values never do. `API_KEY=sk-live-…` is shown as `API_KEY=[REDACTED]`; lines that aren't `key = value` / `key: value` (such as PEM bodies) become `[REDACTED]`. Near-miss errors report only the line number.
-- **Other files:** only likely secrets are replaced with `[REDACTED]`: values of keys like `password`, `token`, `api_key`, `secret`; bearer/basic credentials; passwords in URLs; PEM headers; and long opaque tokens mixing letters and digits (24+ characters). Ordinary code stays verbatim.
+- **Other files:** only likely secrets are replaced with `[REDACTED]`:
+  - the whole value (quoted, or bare up to `,` `;` `#` `)` `//` or the end of the line) assigned to a key whose words include `password`, `pass`, `pw`, `token`, `secret`, `auth`, `authorization`, `credential`, `bearer`, or the pairs `api key`, `access key`, `private key`, `secret key`, `client secret`. Keys are split into words, so `apiKey`, `API_KEY` and `db.password` match while `author`, `tokenizer`, `passport` or `sessionTimeout` don't;
+  - well-known token formats (AWS `AKIA…`, GitHub `ghp_…`, GitLab `glpat-…`, Slack `xox…`, Stripe `sk_live_…`, `sk-…` API keys, Google `AIza…`, npm `npm_…`, JWTs), bearer/basic credentials, passwords in URLs and PEM headers;
+  - long random-looking strings: 24+ characters mixing upper case, lower case and at least three separate runs of digits. Hex hashes (git SHAs, checksums), UUIDs, `sha512-…` integrity hashes, paths and ordinary identifiers stay verbatim.
 
-Redaction is pattern-based and best-effort: it can miss secrets that look like ordinary text (a short password with no telling key name) and can hide harmless long identifiers such as hashes.
+The same redaction applies to the `find` text echoed in "ambiguous" and "not found" errors. It runs in linear time, so long minified lines can't stall a response.
+
+Redaction is pattern-based and best-effort. It still misses secrets with no telling key name (`const p = "hunter2"`, `mysql -phunter2`), values on a different line from their key, and short tokens of unknown formats; occasionally it may hide a harmless random-looking string.
+
+**Redacted text can't be written back.** Any `find` or `replace` containing `[REDACTED]` is rejected before any file is touched, so an agent can't copy a redacted response into a file. The literal text `[REDACTED]` therefore can't be written with this tool.
+
+The library result object (`files[].applied[].find` / `.replace`) is not redacted: it holds the caller's own input verbatim. Only the formatted response, the `context` and the `diff` are redacted.
 
 ## Library API
 
@@ -195,7 +206,9 @@ Passing neither, or both, fails with an error and writes nothing.
 
 These come from Node.js and POSIX file semantics. They are documented on purpose rather than patched with non-portable workarounds.
 
-- **Residual race window:** the concurrent-modification check runs right before the renames, but a write that lands between that check and the `rename()` can still be lost. Closing that gap needs advisory locks (`flock`), which Node.js does not expose portably.
+- **Residual race window:** the checks run right before each `rename()`, but a write by another process that lands in the microseconds between the last check and the `rename()` can still be lost; the same applies to a rollback restore. Closing that gap needs advisory locks (`flock`), which Node.js does not expose portably, and which other programs would also have to honour.
+- **Swaps by a concurrent local process:** the checks above shrink the window to the time between the last check and the `rename()` call (microseconds), but can't close it: that needs `openat`/`renameat`-style calls, which Node.js doesn't expose. The sandbox is meant to contain the paths an agent sends, not a hostile process that already has write access inside the root and races the server.
+- **Windows:** there is no `O_NOFOLLOW`, so the "last component is not a symlink" protection on open is missing there; the identity checks before rename still apply. Creating symlinks on Windows requires extra privileges by default, which makes this attack harder.
 - **Hard links:** a file is replaced through temp file + `rename()`, so a file with several hard links is split. The edited path gets the new content and the other links keep the old content.
 - **File ownership:** permission bits are preserved, but the owner and group are not. If the server runs as a different user than the file's owner, the edited file will belong to the server's user.
 
