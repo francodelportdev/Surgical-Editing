@@ -18,6 +18,8 @@ Agents often rewrite whole lines or blocks just to change one word. That costs o
 
 ## Usage
 
+The full reference for the `surgical_replace` tool (every parameter, the response formats, and every error message with what to do about it) is in [docs/tool-reference.md](https://github.com/francodelportdev/Surgical-Editing/blob/main/docs/tool-reference.md).
+
 ### Multi-file transaction
 
 ```json
