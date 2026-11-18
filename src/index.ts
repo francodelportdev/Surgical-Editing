@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { ConfigError, parseConfig, USAGE, type ServerConfig } from "./config.js";
 import { recoverJournals } from "./journal.js";
@@ -25,7 +26,10 @@ function loadConfig(): ServerConfig {
 const config = loadConfig();
 const { rootDir, limits, responseContent } = config;
 
-const server = new McpServer({ name: "surgical-editing-server", version: "0.3.0" });
+// Read from package.json (one level up from both src/ and dist/) so the advertised version can't drift.
+const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+
+const server = new McpServer({ name: "surgical-editing-server", version });
 
 // Schema caps are a defensive backstop at twice each limit; the engine enforces the limits with clearer messages.
 const backstop = (limit: number): number => Math.min(Number.MAX_SAFE_INTEGER, limit * 2);

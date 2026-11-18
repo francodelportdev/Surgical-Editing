@@ -101,41 +101,51 @@ Temp files (`.<name>.<12 hex digits>.tmp`) that a crash leaves behind outside an
 
 ## Installation
 
-Requires Node.js 22 or later.
+Requires Node.js 22 or later. There is nothing to install by hand: MCP clients start the server with `npx`, which downloads it from npm on first use.
 
 ```bash
-git clone <repo> surgical-editing
-cd surgical-editing
-npm install
-npm run build
+npx -y surgical-editing          # starts the server on stdio, sandboxed to the current directory
 ```
 
-Once the package is on npm, you can run it with `npx -y surgical-editing` instead.
+To pin a version, use `npx -y surgical-editing@0.4.0`. For a global install instead, `npm install -g surgical-editing` puts a `surgical-editing` command on your PATH.
 
 ## Configuration
+
+Point `--root` at your project: clients often start servers from your home directory, and the sandbox defaults to the directory the server starts in.
 
 ### Claude Code
 
 ```bash
-claude mcp add surgical-editing-server -- node /absolute/path/to/surgical-editing/dist/index.js
-# or, once it is on npm:
-claude mcp add surgical-editing-server -- npx -y surgical-editing
+claude mcp add surgical-editing -- npx -y surgical-editing --root /path/to/project
 ```
 
 ### Other MCP clients
 
-Most clients (Cline, Claude Desktop via `claude_desktop_config.json`, project `.mcp.json`) accept this shape:
+Most clients (Claude Desktop via `claude_desktop_config.json`, Cursor, Cline, VS Code, project `.mcp.json`) accept this shape:
 
 ```json
 {
   "mcpServers": {
-    "surgical-editing-server": {
-      "command": "node",
-      "args": ["/absolute/path/to/surgical-editing/dist/index.js"]
+    "surgical-editing": {
+      "command": "npx",
+      "args": ["-y", "surgical-editing", "--root", "/path/to/project"]
     }
   }
 }
 ```
+
+Environment variables (limits, `SURGICAL_RESPONSE_CONTENT`) go in the client's `env` field for the server, for example `"env": { "SURGICAL_RESPONSE_CONTENT": "none" }`.
+
+### From source
+
+```bash
+git clone https://github.com/francodelportdev/Surgical-Editing.git
+cd Surgical-Editing
+npm install
+npm run build
+```
+
+Then use `node /absolute/path/to/Surgical-Editing/dist/index.js` as the command instead of `npx -y surgical-editing`.
 
 ### Sandbox (on by default)
 
@@ -146,17 +156,6 @@ Edits are restricted to one directory tree. The root is, in order of precedence:
 3. the server's current working directory
 
 Relative `file_path` values resolve against the root. Any target outside it fails with `Path traversal blocked`, including through a symlink that points outside the root (the error does not reveal where the link points).
-
-```json
-{
-  "mcpServers": {
-    "surgical-editing-server": {
-      "command": "node",
-      "args": ["/absolute/path/to/surgical-editing/dist/index.js", "--root", "/path/to/project"]
-    }
-  }
-}
-```
 
 Invalid configuration is fatal (exit code 2) and never falls back to running unsandboxed: `--root` without a value, a root that doesn't exist or isn't a directory, a repeated `--root`, and any unknown argument are all rejected.
 

@@ -205,6 +205,13 @@ describe("H1/H4: end-to-end over MCP", () => {
     assert.equal(readFileSync(path.join(root, "inside.txt"), "utf8"), "v = 2\n");
   });
 
+  test("the server advertises the version from package.json", async () => {
+    const { version } = JSON.parse(readFileSync(path.join(REPO, "package.json"), "utf8")) as { version: string };
+    await withClient(root, [], async (c) => {
+      assert.deepEqual(c.getServerVersion(), { name: "surgical-editing-server", version });
+    });
+  });
+
   test("--unsafe-no-root allows edits outside the CWD", async () => {
     const outside = path.join(base, "outside.txt");
     writeFileSync(outside, "v = 1\n");
