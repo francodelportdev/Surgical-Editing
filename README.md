@@ -119,11 +119,15 @@ Most clients (Cline, Claude Desktop via `claude_desktop_config.json`, project `.
 }
 ```
 
-Relative `file_path` values resolve against the server's working directory. Use absolute paths when that is ambiguous.
+### Sandbox (on by default)
 
-### Sandbox
+Edits are restricted to one directory tree. The root is, in order of precedence:
 
-Restrict edits to one directory tree with the `SURGICAL_ROOT_DIR` environment variable or the `--root <dir>` flag (the flag wins):
+1. `--root <dir>` or `--root=<dir>`
+2. the `SURGICAL_ROOT_DIR` environment variable
+3. the server's current working directory
+
+Relative `file_path` values resolve against the root. Any target outside it fails with `Path traversal blocked`, including through a symlink that points outside the root (the error does not reveal where the link points).
 
 ```json
 {
@@ -136,11 +140,28 @@ Restrict edits to one directory tree with the `SURGICAL_ROOT_DIR` environment va
 }
 ```
 
-When a root is set, relative paths resolve against it. Any target outside it fails with `Path traversal blocked`, including through a symlink that points outside the root. If the root itself doesn't exist, the server refuses to start.
+Invalid configuration is fatal (exit code 2) and never falls back to running unsandboxed: `--root` without a value, a root that doesn't exist or isn't a directory, a repeated `--root`, and any unknown argument are all rejected.
+
+To disable the sandbox you must pass `--unsafe-no-root` explicitly. The server then prints a warning on stderr and the tool description tells the agent that the sandbox is disabled. In this mode the agent can edit any file the server's user can write.
+
+### Resource limits
+
+Every request is checked against these limits before any file is touched. Exceeding one returns a clear error and writes nothing. Override them with environment variables (positive integers; an invalid value stops the server):
+
+| Limit | Default | Variable |
+|---|---|---|
+| File size (read, and size of the edited result) | 10 MiB (10485760 bytes) | `SURGICAL_MAX_FILE_BYTES` |
+| Operations per transaction | 100 | `SURGICAL_MAX_OPERATIONS` |
+| Replacements per transaction (all files) | 1000 | `SURGICAL_MAX_REPLACEMENTS` |
+| Characters in one `find` | 100000 | `SURGICAL_MAX_FIND_CHARS` |
+| Characters in one `replace` | 1000000 | `SURGICAL_MAX_REPLACE_CHARS` |
+| Characters in an error message | 2000 | `SURGICAL_MAX_DIAGNOSTIC_CHARS` |
 
 ## Safety guarantees
 
 - **Symlinks:** edits are applied to the file the link points to, and the link stays intact.
+- **Secrets in diagnostics:** near-miss hints never show content from credential files (`.env*`, `*.pem`, `*.key`, `id_rsa`, `.npmrc`, `.netrc`, anything under `.ssh/`, `.aws/`…); they report only the line number. In other files, likely secrets (`password=`, `api_key:`, bearer tokens, URL credentials, long opaque tokens) are replaced with `[REDACTED]`. This is pattern-based and best-effort. Success output and dry-run diffs still show the edited region.
+- **Permissions:** the exact permission bits, setuid/setgid/sticky included, are restored on the new file regardless of the server's umask.
 - **Encoding:** invalid UTF-8 and binary files (with NUL bytes) are rejected before anything is written. A UTF-8 BOM is preserved.
 - **Concurrent changes:** if a file's mtime or size changes between the read and the commit, the whole transaction is aborted.
 

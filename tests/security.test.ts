@@ -58,7 +58,7 @@ describe("security hardening", () => {
 
       assert.equal(result.ok, false);
       if (result.ok) return;
-      assert.match(result.error, /Path traversal blocked: .* resolves to/);
+      assert.match(result.error, /Path traversal blocked: .* resolves outside/);
       assert.equal(readFileSync(outside, "utf8"), "secret = 1\n");
     });
 

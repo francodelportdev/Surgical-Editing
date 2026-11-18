@@ -1,29 +1,27 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { realpathSync } from "node:fs";
 import { z } from "zod";
+import { ConfigError, parseConfig, USAGE, type ServerConfig } from "./config.js";
 import { formatTransaction, surgicalTransaction, type Operation } from "./surgical.js";
 
 /**
- * Sandbox root from `--root <dir>` or SURGICAL_ROOT_DIR (the flag wins).
- * Resolved once at startup with realpath so comparisons against resolved
- * target paths are reliable; a bad root is fatal rather than silently
- * running unsandboxed.
+ * Sandbox root: `--root <dir>` / `--root=<dir>`, else SURGICAL_ROOT_DIR, else
+ * the current directory. Any invalid configuration is fatal; only the explicit
+ * `--unsafe-no-root` flag disables the sandbox.
  */
-function resolveRootDir(): string | undefined {
-  const flagIndex = process.argv.indexOf("--root");
-  const raw = flagIndex !== -1 ? process.argv[flagIndex + 1] : process.env.SURGICAL_ROOT_DIR;
-  if (raw === undefined || raw === "") return undefined;
+function loadConfig(): ServerConfig {
   try {
-    return realpathSync(raw);
-  } catch {
-    console.error(`Invalid sandbox root (SURGICAL_ROOT_DIR / --root): ${raw}`);
-    process.exit(1);
+    return parseConfig(process.argv.slice(2), process.env, process.cwd());
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    console.error(`surgical-editing: ${err.message}\n${USAGE}`);
+    process.exit(2);
   }
 }
 
-const rootDir = resolveRootDir();
+const config = loadConfig();
+const { rootDir, limits } = config;
 
 const server = new McpServer({ name: "surgical-editing-server", version: "0.3.0" });
 
@@ -44,7 +42,10 @@ server.registerTool(
       "Transactional exact-match editor. Send ONLY the minimal snippets to change, across one or more files. " +
       "Each `find` must appear exactly once in its file. All operations are atomic: if any replacement fails, " +
       "no file is written. On a miss, the error points to the most similar line so you can retry without re-reading. " +
-      "Set dry_run to get a unified diff without writing.",
+      "Set dry_run to get a unified diff without writing. " +
+      (config.unsafe
+        ? "WARNING: sandbox disabled (--unsafe-no-root); any file this user can write is editable."
+        : `Edits are restricted to ${rootDir}; relative paths resolve against it.`),
     inputSchema: {
       operations: z
         .array(
@@ -75,7 +76,7 @@ server.registerTool(
       return errorResult("Missing input: provide `operations` (or the legacy `file_path` + `replacements`).");
     }
 
-    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir });
+    const result = await surgicalTransaction(ops, { dryRun: dry_run ?? false, rootDir, limits });
     if (!result.ok) return errorResult(result.error);
     return { content: [{ type: "text" as const, text: formatTransaction(result) }] };
   },
@@ -89,7 +90,15 @@ async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   // stdout is reserved for the MCP protocol; log to stderr only.
-  console.error(`surgical-editing-server MCP server running on stdio${rootDir ? ` (sandbox: ${rootDir})` : ""}`);
+  if (config.unsafe) {
+    console.error(
+      "WARNING: surgical-editing is running with --unsafe-no-root. The sandbox is DISABLED: " +
+        "the agent can edit any file this user can write.",
+    );
+    console.error("surgical-editing-server MCP server running on stdio (sandbox: DISABLED)");
+  } else {
+    console.error(`surgical-editing-server MCP server running on stdio (sandbox: ${rootDir})`);
+  }
 }
 
 main().catch((err: unknown) => {

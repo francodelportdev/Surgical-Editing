@@ -2,8 +2,10 @@ import { randomBytes } from "node:crypto";
 // Accessed as `fs.*` (not destructured) so tests can intercept calls with mock.method.
 import fs from "node:fs/promises";
 import path from "node:path";
+import { DEFAULT_LIMITS, type Limits } from "./config.js";
 import { unifiedDiff } from "./diff.js";
 import { findClosestMatch } from "./matcher.js";
+import { isSensitivePath, redactText, truncate } from "./redact.js";
 
 export interface Replacement {
   find: string;
@@ -22,6 +24,8 @@ export interface TransactionOptions {
    * target must stay inside it, both before and after following symlinks.
    */
   rootDir?: string;
+  /** Resource limits; unspecified fields use DEFAULT_LIMITS. */
+  limits?: Partial<Limits>;
 }
 
 export interface AppliedReplacement {
@@ -196,17 +200,22 @@ async function resolveTarget(rawPath: string, rootDir: string | undefined): Prom
 
   // Check again after resolution: a symlink inside the root may point outside it.
   if (rootDir !== undefined && !isInside(rootDir, real)) {
-    return `Path traversal blocked: ${requested} resolves to ${real}, outside SURGICAL_ROOT_DIR (${rootDir})`;
+    // Don't echo `real`: it would disclose where outside the root the link points.
+    return `Path traversal blocked: ${requested} is a symlink that resolves outside SURGICAL_ROOT_DIR (${rootDir})`;
   }
   return { path: real };
 }
 
-async function loadFile(filePath: string): Promise<FileState | string> {
+async function loadFile(filePath: string, maxFileBytes: number): Promise<FileState | string> {
   let bytes: Buffer;
   let info: Awaited<ReturnType<typeof fs.stat>>;
   try {
     info = await fs.stat(filePath);
     if (!info.isFile()) return `Not a regular file: ${filePath}`;
+    // Checked before reading so an oversized file is never loaded into memory.
+    if (info.size > maxFileBytes) {
+      return `File is ${info.size} bytes, above the ${maxFileBytes}-byte limit (SURGICAL_MAX_FILE_BYTES).`;
+    }
     bytes = await fs.readFile(filePath);
   } catch (err) {
     return describeFsError(err, "read", filePath);
@@ -237,14 +246,19 @@ async function loadFile(filePath: string): Promise<FileState | string> {
   };
 }
 
-function notFoundMessage(content: string, find: string): string {
+function notFoundMessage(content: string, find: string, filePath: string): string {
   // Before giving up, point the agent at the closest region so it can correct
   // its snippet without another full read of the file.
   const closest = findClosestMatch(content, find);
   if (closest) {
     const pct = Math.round(closest.similarity * 100);
     const hint = closest.hint ? ` Hint: ${closest.hint}` : "";
-    return `No exact match found. Line ${closest.line} contains (${pct}% similar): '${closest.text}'.${hint}`;
+    // The excerpt is file content the agent didn't send: never show it for
+    // credential files, and redact likely secrets everywhere else.
+    if (isSensitivePath(filePath)) {
+      return `No exact match found. Line ${closest.line} is ${pct}% similar (content hidden: sensitive file).${hint}`;
+    }
+    return `No exact match found. Line ${closest.line} contains (${pct}% similar): '${redactText(closest.text)}'.${hint}`;
   }
   return (
     `"find" text ${preview(find)} was not found. It must match the file exactly ` +
@@ -264,7 +278,7 @@ function applyReplacement(state: FileState, operation: number, index: number, r:
   // ambiguous we cannot know which occurrence it meant, and guessing could
   // silently corrupt the file.
   const occurrences = findOccurrences(state.content, r.find);
-  if (occurrences.length === 0) return notFoundMessage(state.content, r.find);
+  if (occurrences.length === 0) return notFoundMessage(state.content, r.find, state.filePath);
   if (occurrences.length > 1) {
     // Listing where each occurrence lives tells the agent which context to add
     // without re-reading the file.
@@ -353,6 +367,10 @@ async function commit(states: readonly FileState[]): Promise<string | undefined>
     staged.push({ state, tmp });
     try {
       await fs.writeFile(tmp, encode(state), { mode: state.mode });
+      // The mode passed at creation is filtered by the umask (0666 → 0644
+      // under umask 022). chmod is not, so it restores the exact original
+      // bits, including setuid/setgid/sticky, rather than silently changing them.
+      await fs.chmod(tmp, state.mode & 0o7777);
     } catch (err) {
       await discardTemps();
       return describeFsError(err, "write", state.filePath);
@@ -404,8 +422,54 @@ export async function surgicalTransaction(
   operations: readonly Operation[],
   options: TransactionOptions = {},
 ): Promise<TransactionResult> {
+  const limits: Limits = { ...DEFAULT_LIMITS, ...options.limits };
+  const result = await runTransaction(operations, options, limits);
+  if (result.ok) return result;
+  return { ok: false, error: capDiagnostic(result.error, limits.maxDiagnosticChars) };
+}
+
+/** Caps an error message while keeping the "No files were written." guarantee visible. */
+function capDiagnostic(error: string, max: number): string {
+  if (error.length <= max) return error;
+  if (error.endsWith(NOTHING_WRITTEN)) {
+    const head = error.slice(0, error.length - NOTHING_WRITTEN.length).trimEnd();
+    return `${truncate(head, Math.max(0, max - NOTHING_WRITTEN.length - 1))} ${NOTHING_WRITTEN}`;
+  }
+  return truncate(error, max);
+}
+
+/** Rejects oversized requests before any file is touched. */
+function checkRequestLimits(operations: readonly Operation[], limits: Limits): string | undefined {
+  if (operations.length > limits.maxOperations) {
+    return `Too many operations: ${operations.length}, limit is ${limits.maxOperations} (SURGICAL_MAX_OPERATIONS). Split the change into smaller transactions.`;
+  }
+  let total = 0;
+  for (const [opIndex, op] of operations.entries()) {
+    total += op.replacements.length;
+    if (total > limits.maxReplacements) {
+      return `Too many replacements: more than ${limits.maxReplacements} in one transaction (SURGICAL_MAX_REPLACEMENTS).`;
+    }
+    for (const [index, r] of op.replacements.entries()) {
+      if (r.find.length > limits.maxFindChars) {
+        return `Operation #${opIndex}, Replacement #${index}: "find" is ${r.find.length} characters, limit is ${limits.maxFindChars} (SURGICAL_MAX_FIND_CHARS).`;
+      }
+      if (r.replace.length > limits.maxReplaceChars) {
+        return `Operation #${opIndex}, Replacement #${index}: "replace" is ${r.replace.length} characters, limit is ${limits.maxReplaceChars} (SURGICAL_MAX_REPLACE_CHARS).`;
+      }
+    }
+  }
+  return undefined;
+}
+
+async function runTransaction(
+  operations: readonly Operation[],
+  options: TransactionOptions,
+  limits: Limits,
+): Promise<TransactionResult> {
   const dryRun = options.dryRun ?? false;
   if (operations.length === 0) return { ok: false, error: `No operations provided. ${NOTHING_WRITTEN}` };
+  const limitError = checkRequestLimits(operations, limits);
+  if (limitError !== undefined) return { ok: false, error: `${limitError} ${NOTHING_WRITTEN}` };
 
   // Several operations may target the same file (even via different relative
   // paths or symlinks); keying by physical path makes them share one
@@ -420,7 +484,7 @@ export async function surgicalTransaction(
     }
     resolved.push(target.path);
     if (files.has(target.path)) continue;
-    const loaded = await loadFile(target.path);
+    const loaded = await loadFile(target.path, limits.maxFileBytes);
     if (typeof loaded === "string") {
       return { ok: false, error: `Operation #${opIndex} (${target.path}): ${loaded} ${NOTHING_WRITTEN}` };
     }
@@ -444,6 +508,15 @@ export async function surgicalTransaction(
   }
 
   const states = [...files.values()];
+  for (const state of states) {
+    const size = encode(state).length;
+    if (size > limits.maxFileBytes) {
+      return {
+        ok: false,
+        error: `${state.filePath}: the edited file would be ${size} bytes, above the ${limits.maxFileBytes}-byte limit (SURGICAL_MAX_FILE_BYTES). ${NOTHING_WRITTEN}`,
+      };
+    }
+  }
   states.forEach(finalizeApplied);
   const changes: FileChange[] = states.map((s) => ({
     filePath: s.filePath,
