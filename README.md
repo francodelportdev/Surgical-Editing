@@ -84,9 +84,12 @@ The diff is meant for review, not for `patch`/`git apply`: lines are redacted as
 ## How atomicity works
 
 1. Every file is read and every replacement is validated in memory. Any failure aborts the call before anything is written.
-2. Each new version is written to a temp file next to its target. Most I/O failures (permissions, a full disk) happen at this step, while the originals are still untouched. If one fails, all temp files are removed.
+2. Each new version is written to a temp file next to its target and flushed to disk (`fsync`). Most I/O failures (permissions, a full disk) happen at this step, while the originals are still untouched. If one fails, all temp files are removed.
 3. Before the first rename, every file is checked against what was read: same file (inode), same mtime and size, and the same bytes. Right before each rename the cheap checks run again.
 4. The temp files replace the originals via `rename()`, which is atomic per file on POSIX. If a rename still fails, files that were already replaced are rolled back, again through a temp file and `rename()`, so a restore is atomic too. A file is only restored if it still holds exactly what this transaction wrote; if someone edited it in the meantime, their edit is kept and the error names the file.
+5. After the renames, each affected directory is flushed too, so the renames survive a power loss. This step is best-effort: Windows and some filesystems can't flush a directory, and a failure there doesn't undo an applied transaction.
+
+**What survives a crash.** If the server process is killed or the machine loses power, each file is either entirely old or entirely new: never empty, truncated or mixed. A multi-file transaction interrupted between two renames, however, can end up partly applied, because there is no journal to finish or undo it after a restart. It also leaves its remaining temp files (`.<name>.<12 hex digits>.tmp`) next to their targets. At startup the server scans the sandbox root (skipping `node_modules` and `.git`, up to 100,000 entries) and prints a warning on stderr listing any it finds. It never deletes them: they hold the new content that was never applied, so review them and delete them yourself.
 
 ## Installation
 
@@ -162,6 +165,8 @@ Every request is checked against these limits before any file is touched. Exceed
 | Characters in one `replace` | 1000000 | `SURGICAL_MAX_REPLACE_CHARS` |
 | Characters in an error message | 2000 | `SURGICAL_MAX_DIAGNOSTIC_CHARS` |
 | Work per transaction, in characters scanned | 1000000000 | `SURGICAL_MAX_WORK_CHARS` |
+
+The MCP tool schema also rejects requests above **twice** these limits, as a backstop that stops absurdly large requests before they reach the engine. Between the limit and twice the limit the engine answers, with the detailed messages above; beyond it the client gets a schema validation error such as `Too big: expected array to have <=200 items at operations`.
 
 Each replacement scans its whole file once, so the work of a transaction is roughly the sum, over every replacement, of the size of its file. A transaction above the budget (for example 1000 replacements on a 10 MB file) is rejected before any edit is applied, with a message that suggests fewer, larger replacements or several smaller transactions. The default keeps the worst accepted transaction at a few seconds on a typical machine.
 
