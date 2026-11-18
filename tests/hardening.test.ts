@@ -31,7 +31,7 @@ let base: string;
 let root: string;
 
 beforeEach(() => {
-  base = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-hardening-")));
+  base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-hardening-")));
   root = path.join(base, "root");
   mkdirSync(root);
 });

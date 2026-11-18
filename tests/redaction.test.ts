@@ -13,7 +13,7 @@ const TSX = import.meta.resolve("tsx");
 
 let dir: string;
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-redaction-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-redaction-")));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

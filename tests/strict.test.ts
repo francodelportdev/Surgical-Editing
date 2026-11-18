@@ -16,7 +16,7 @@ const FILE_WORDS = ["db.internal", "retries", "franco", "const"];
 
 let dir: string;
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-strict-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-strict-")));
   writeFileSync(path.join(dir, "a.ts"), FILE);
 });
 afterEach(() => {

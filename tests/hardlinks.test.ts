@@ -7,7 +7,7 @@ import { surgicalTransaction } from "../src/surgical.js";
 
 let dir: string;
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-hardlinks-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-hardlinks-")));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

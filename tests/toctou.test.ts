@@ -15,7 +15,7 @@ const realWriteFile = fs.writeFile.bind(fs);
 const realRename = fs.rename.bind(fs);
 
 beforeEach(() => {
-  base = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-toctou-")));
+  base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-toctou-")));
   root = path.join(base, "root");
   outside = path.join(base, "outside");
   mkdirSync(path.join(root, "sub"), { recursive: true });

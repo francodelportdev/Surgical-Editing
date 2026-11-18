@@ -204,21 +204,22 @@ async function resolveTarget(rawPath: string, sandbox: Sandbox | undefined): Pro
 
   const { rootDir, realRoot } = sandbox;
   const requested = path.resolve(rootDir, rawPath);
-  // Accept either spelling of the root (e.g. /var vs /private/var); the realpath check below is authoritative.
-  if (!isInside(path.resolve(rootDir), requested) && !isInside(realRoot, requested)) {
-    return `Path traversal blocked: ${requested} is outside SURGICAL_ROOT_DIR (${rootDir})`;
-  }
+  // A path can name a file inside the root in another spelling (/var vs /private/var, Windows 8.3 short names), so
+  // the textual check only picks the message; containment is decided on the real path below.
+  const outsideAsWritten = !isInside(path.resolve(rootDir), requested) && !isInside(realRoot, requested);
+  const blocked = `Path traversal blocked: ${requested} is outside SURGICAL_ROOT_DIR (${rootDir})`;
 
   // Follow symlinks so the temp file + rename replaces the real file instead of the link.
   let real: string;
   try {
     real = await fs.realpath(requested);
   } catch (err) {
-    return describeFsError(err, "read", requested);
+    // Same answer whether or not an outside path exists, so errors can't probe outside the root.
+    return outsideAsWritten ? blocked : describeFsError(err, "read", requested);
   }
   // Don't echo `real`: it would disclose where outside the root the link points.
   if (!isInside(realRoot, real)) {
-    return `Path traversal blocked: ${requested} is a symlink that resolves outside SURGICAL_ROOT_DIR (${rootDir})`;
+    return outsideAsWritten ? blocked : `Path traversal blocked: ${requested} is a symlink that resolves outside SURGICAL_ROOT_DIR (${rootDir})`;
   }
   if (isInside(journalRoot(realRoot), real)) {
     return `Path blocked: ${requested} is inside the crash-recovery journal, which only the server may change`;

@@ -11,7 +11,7 @@ const realWriteFile = fs.writeFile.bind(fs);
 const realRename = fs.rename.bind(fs);
 
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-rollback-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-rollback-")));
 });
 afterEach(() => {
   mock.restoreAll();

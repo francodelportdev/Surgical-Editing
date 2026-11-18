@@ -18,7 +18,7 @@ const MB = 1024 * 1024;
 
 let dir: string;
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-perf-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-perf-")));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -67,11 +67,14 @@ const run = (replacements: Replacement[], limits = {}) =>
 
 // Runs the transaction in a child process killed at the deadline: blocking CPU work can't be interrupted in-process.
 function runIsolated(replacements: Replacement[]): Awaited<ReturnType<typeof run>> {
+  // Replacements go through stdin: Windows caps a command line at 32 KB.
   const script =
     `const { surgicalTransaction } = await import(${JSON.stringify(ENGINE)});` +
-    `const r = await surgicalTransaction([{ file_path: "f.txt", replacements: ${JSON.stringify(replacements)} }], { rootDir: ${JSON.stringify(dir)} });` +
+    `let input = ""; for await (const chunk of process.stdin) input += chunk;` +
+    `const r = await surgicalTransaction([{ file_path: "f.txt", replacements: JSON.parse(input) }], { rootDir: ${JSON.stringify(dir)} });` +
     `process.stdout.write(JSON.stringify(r));`;
   const child = spawnSync(process.execPath, ["--import", TSX, "--input-type=module", "-e", script], {
+    input: JSON.stringify(replacements),
     encoding: "utf8",
     timeout: LARGE_INPUT_TIMEOUT,
     maxBuffer: 64 * MB,

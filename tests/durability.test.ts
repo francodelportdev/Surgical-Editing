@@ -20,7 +20,7 @@ const realOpen = fs.open.bind(fs);
 const realRename = fs.rename.bind(fs);
 
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-durability-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-durability-")));
 });
 afterEach(() => {
   mock.restoreAll();

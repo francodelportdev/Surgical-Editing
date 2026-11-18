@@ -76,7 +76,8 @@ describe("surgicalTransaction (multi-file)", () => {
     assert.equal(readFileSync(fileA, "utf8"), "export const port = 3000;\n");
   });
 
-  test("reports permission errors and leaves no temp files behind", { skip: process.getuid?.() === 0 }, async () => {
+  // Skipped as root (bypasses permissions) and on Windows, where chmod only toggles the read-only attribute.
+  test("reports permission errors and leaves no temp files behind", { skip: process.getuid?.() === 0 || process.platform === "win32" }, async () => {
     // A read-only directory blocks creating the temp file, so the commit must
     // fail before any original is replaced.
     chmodSync(dir, 0o555);

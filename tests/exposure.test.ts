@@ -12,7 +12,7 @@ let base: string;
 let root: string;
 
 beforeEach(() => {
-  base = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-exposure-")));
+  base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-exposure-")));
   root = path.join(base, "root");
   mkdirSync(root);
 });
@@ -158,6 +158,25 @@ describe("P3: rootDir is canonicalized", () => {
     assert.equal((await surgicalTransaction(edit(path.join(alias, "a.txt"), "v = 2", "v = 3"), { rootDir: alias })).ok, true);
     assert.equal((await surgicalTransaction(edit(path.join(root, "a.txt"), "v = 3", "v = 4"), { rootDir: alias })).ok, true);
     assert.equal(readFileSync(path.join(root, "a.txt"), "utf8"), "v = 4\n");
+  });
+
+  test("a file inside the root is accepted even when the path names it through another spelling", async () => {
+    // The alias plays the role of another spelling of the root, like /var vs /private/var or a Windows 8.3 name.
+    const r = await surgicalTransaction(edit(path.join(alias, "a.txt")), { rootDir: root });
+    assert.equal(r.ok, true, r.ok ? "" : r.error);
+    assert.equal(readFileSync(path.join(root, "a.txt"), "utf8"), "v = 2\n");
+  });
+
+  test("outside paths get the same error whether or not they exist, so errors can't probe outside the root", async () => {
+    const message = async (target: string) => {
+      const r = await surgicalTransaction(edit(target), { rootDir: root });
+      assert.equal(r.ok, false, target);
+      return r.ok ? "" : r.error.replace(target, "<path>");
+    };
+    const existing = await message(path.join(base, "outside.txt"));
+    const missing = await message(path.join(base, "missing.txt"));
+    assert.match(existing, /Path traversal blocked: .* is outside SURGICAL_ROOT_DIR/);
+    assert.equal(existing, missing);
   });
 
   test("containment still holds through a symlinked rootDir", async () => {

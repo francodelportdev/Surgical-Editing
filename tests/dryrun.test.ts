@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, test } from "node:test";
@@ -12,7 +12,8 @@ describe("dry run", () => {
   let file: string;
 
   beforeEach(() => {
-    dir = mkdtempSync(path.join(tmpdir(), "surgical-editing-"));
+    // Native realpath, like the engine: macOS tmpdir is a symlink and Windows may report 8.3 short names.
+    dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-editing-")));
     file = path.join(dir, "config.ts");
     writeFileSync(file, ORIGINAL, "utf8");
   });

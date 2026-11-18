@@ -18,7 +18,7 @@ const FILES = ["a.txt", "sub/b.txt", "deep/nested/c.txt"];
 
 let root: string;
 beforeEach(() => {
-  root = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-journal-")));
+  root = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-journal-")));
   for (const name of FILES) {
     mkdirSync(path.dirname(path.join(root, name)), { recursive: true });
     writeFileSync(path.join(root, name), `${name} = 1\n`);
@@ -37,22 +37,27 @@ const tempFiles = () => readdirSync(root, { recursive: true }).map(String).filte
 function crash(point: "after-first-rename" | "after-second-rename" | "before-journal-removal" | "while-writing-manifest"): void {
   const killers = {
     "after-first-rename": `let n = 0; const rename = fs.rename.bind(fs);
-      mock.method(fs, "rename", async (a, b) => { await rename(a, b); if (++n === 1) process.kill(process.pid, "SIGKILL"); });`,
+      mock.method(fs, "rename", async (a, b) => { await rename(a, b); if (++n === 1) crashNow(); });`,
     "after-second-rename": `let n = 0; const rename = fs.rename.bind(fs);
-      mock.method(fs, "rename", async (a, b) => { await rename(a, b); if (++n === 2) process.kill(process.pid, "SIGKILL"); });`,
-    "before-journal-removal": `mock.method(fs, "rm", async () => process.kill(process.pid, "SIGKILL"));`,
+      mock.method(fs, "rename", async (a, b) => { await rename(a, b); if (++n === 2) crashNow(); });`,
+    "before-journal-removal": `mock.method(fs, "rm", async () => crashNow());`,
     "while-writing-manifest": `const open = fs.open.bind(fs);
-      mock.method(fs, "open", async (p, ...rest) => { if (String(p).endsWith("manifest.json")) process.kill(process.pid, "SIGKILL"); return open(p, ...rest); });`,
+      mock.method(fs, "open", async (p, ...rest) => { if (String(p).endsWith("manifest.json")) crashNow(); return open(p, ...rest); });`,
   };
+  // The marker is written synchronously: Windows reports no signal for a killed process, only exit code 1.
   const script = `
     import fs from "node:fs/promises";
+    import { writeSync } from "node:fs";
     import { mock } from "node:test";
+    const crashNow = () => { writeSync(1, "CRASHING\\n"); process.kill(process.pid, "SIGKILL"); };
     const { surgicalTransaction } = await import(${JSON.stringify(ENGINE)});
     ${killers[point]}
     await surgicalTransaction(${JSON.stringify(ops())}, { rootDir: ${JSON.stringify(root)} });
     process.exit(3);`;
   const child = spawnSync(process.execPath, ["--import", TSX, "--input-type=module", "-e", script], { encoding: "utf8", timeout: 30_000 });
-  assert.equal(child.signal, "SIGKILL", `the child must die mid-transaction: ${child.stderr}`);
+  assert.ok(child.stdout.includes("CRASHING"), `the child must reach the crash point: ${child.stderr}`);
+  const killed = child.signal === "SIGKILL" || (process.platform === "win32" && child.status !== 0 && child.status !== 3);
+  assert.ok(killed, `the child must die mid-transaction (signal ${child.signal}, status ${child.status}): ${child.stderr}`);
 }
 
 describe("crash recovery journal", () => {

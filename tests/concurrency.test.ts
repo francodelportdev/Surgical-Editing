@@ -7,7 +7,7 @@ import { pendingFileLocks, surgicalTransaction, type Operation } from "../src/su
 
 let dir: string;
 beforeEach(() => {
-  dir = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-concurrency-")));
+  dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-concurrency-")));
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });

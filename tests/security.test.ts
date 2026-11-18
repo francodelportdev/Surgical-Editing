@@ -22,7 +22,7 @@ describe("security hardening", () => {
 
   beforeEach(() => {
     // realpath: on some systems tmpdir() is itself a symlink (e.g. macOS /var).
-    base = realpathSync(mkdtempSync(path.join(tmpdir(), "surgical-editing-")));
+    base = realpathSync.native(mkdtempSync(path.join(tmpdir(), "surgical-editing-")));
     root = path.join(base, "root");
     mkdirSync(root);
   });

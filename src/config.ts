@@ -80,7 +80,7 @@ export const USAGE =
 function resolveRoot(raw: string, source: string): string {
   let real: string;
   try {
-    real = realpathSync(raw);
+    real = realpathSync.native(raw);
   } catch {
     throw new ConfigError(`Invalid sandbox root from ${source}: ${raw} does not exist or is not accessible.`);
   }
